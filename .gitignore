@@ -1,0 +1,12 @@
+# Source game data — never commit
+*.iso
+*.cso
+*.pbp
+/extract/
+/work/
+/recompiled/
+
+# Game-derived artefacts
+profile/**/generated/
+*.recomp.c
+*.recomp.cpp
