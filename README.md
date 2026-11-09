@@ -19,9 +19,9 @@ an HLE reimplementation of the PSP system software.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Binary forensics, toolchain | **done** |
-| 1 | Container formats, module linkage, engine API | in progress |
-| 1.5 | Input seam (done) + UI state machine map | in progress |
-| 2 | PC bring-up (recompiled build) | pending |
+| 1 | Container formats, module linkage, engine API | **done** |
+| 1.5 | Input seam + UI state machine map | **done** |
+| 2 | PC bring-up (recompiled build) | in progress — toolchain verified, host profile pending |
 | 2.5 | Touch layer | pending |
 | 3 | Android packaging | pending |
 
@@ -38,6 +38,9 @@ an HLE reimplementation of the PSP system software.
   edge detection, so a gesture layer only has to produce 16 bytes per frame.
 - Modular engine: `mgp_main` + 44 per-stage PRX overlays + `sound` / `kjfs` / `zlibdec`
   services loaded at runtime.
+- **The static recompiler works on this module.** PSPRecomp (the framework inside Yakumo)
+  recovers 5,113 functions from `mgp_main` and emits 80.8 MB of C++ across 76 units, which then
+  compiles. See [`docs/05-recompilation.md`](docs/05-recompilation.md).
 
 Full detail:
 
@@ -46,6 +49,7 @@ Full detail:
 - [`docs/02-containers.md`](docs/02-containers.md) — `_zar`, `.psq`, `.a3p`, `.pmf`
 - [`docs/03-input-seam.md`](docs/03-input-seam.md) — the single input call and pad state
 - [`docs/04-ui-intent.md`](docs/04-ui-intent.md) — what the game does with that input; where a tap can and cannot reach
+- [`docs/05-recompilation.md`](docs/05-recompilation.md) — the PSPRecomp framework, and proof it recompiles this module
 
 ## Repository layout
 
