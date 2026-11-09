@@ -20,7 +20,7 @@ an HLE reimplementation of the PSP system software.
 |---|---|---|
 | 0 | Binary forensics, toolchain | **done** |
 | 1 | Container formats, module linkage, engine API | in progress |
-| 1.5 | Input + UI state machine map | pending |
+| 1.5 | Input seam (done) + UI state machine map | in progress |
 | 2 | PC bring-up (recompiled build) | pending |
 | 2.5 | Touch layer | pending |
 | 3 | Android packaging | pending |
@@ -31,8 +31,11 @@ an HLE reimplementation of the PSP system software.
   module name: `mgp_main`.
 - 20 imported libraries / 121 NIDs (108 Sony, 13 Konami-private).
 - **VFPU density: 0.35 %** — the usual blocker for Allegrex recompilation is absent here.
-- `sceCtrl` is polled through **one** call: `sceCtrlReadBufferPositive`. That is the entire
+- `sceCtrl` is polled through **one** call: `sceCtrlReadBufferPositive` at `0x00074908`, with
+  exactly one direct call site and zero indirect references. That single call is the entire
   input seam the touch layer has to replace.
+- The game consumes raw PSP `SceCtrlData` (buttons + `Lx`/`Ly`) and does its own remapping and
+  edge detection, so a gesture layer only has to produce 16 bytes per frame.
 - Modular engine: `mgp_main` + 44 per-stage PRX overlays + `sound` / `kjfs` / `zlibdec`
   services loaded at runtime.
 
@@ -40,6 +43,8 @@ Full detail:
 
 - [`docs/00-forensics.md`](docs/00-forensics.md) — binary, modules, assets, toolchain
 - [`docs/01-nid-map.md`](docs/01-nid-map.md) — complete import map
+- [`docs/02-containers.md`](docs/02-containers.md) — `_zar`, `.psq`, `.a3p`, `.pmf`
+- [`docs/03-input-seam.md`](docs/03-input-seam.md) — the single input call and pad state
 
 ## Repository layout
 
