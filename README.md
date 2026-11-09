@@ -45,6 +45,7 @@ Full detail:
 - [`docs/01-nid-map.md`](docs/01-nid-map.md) — complete import map
 - [`docs/02-containers.md`](docs/02-containers.md) — `_zar`, `.psq`, `.a3p`, `.pmf`
 - [`docs/03-input-seam.md`](docs/03-input-seam.md) — the single input call and pad state
+- [`docs/04-ui-intent.md`](docs/04-ui-intent.md) — what the game does with that input; where a tap can and cannot reach
 
 ## Repository layout
 
