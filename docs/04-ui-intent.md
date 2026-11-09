@@ -95,6 +95,47 @@ Behavior: on a changed direction it resets the counter and applies step `1`; aft
 of holding it switches to step `4`. Movement is clamped against limits read from the widget
 descriptor, so lists stop at their ends.
 
+It is also the *only* stepper of this shape. The constant `21` appears in seven functions
+(`0x0006778C`, `0x00069144`, `0x000A0CB0`, `0x000C4858`, `0x000E9F04`, `0x0011E348`), but
+only `0x0006778C` carries the field layout above, so the repeat logic is not duplicated per
+screen. That matters for the port: a tap layer does not have to reimplement scrolling seven
+times.
+
+### The widget object and its global
+
+Reading the constructor chain around the stepper produced the object map:
+
+| Address | Role |
+|---|---|
+| `0x00067BD0` | object init — zeroes `+0x40`, `+0x44`, and `+0x78`..`+0x94`, returns 1 |
+| `0x00067B18` | per-frame update — gated by flag `0x00076C70 & 1`, then calls the tick and the stepper |
+| `0x0006778C` | frame body — clears `+0x78`..`+0x90` |
+| `0x00067C18` | constructor — allocates **`0x98` = 152 bytes** at `0x00073BA8`, stores the two method pointers `0x00067B18` and `0x00067BB8` |
+| `0x00076C6C` | **global pointer to the active widget** (bss, zero-initialised) |
+| `0x00067CD4` | reads `0x00076C6C`, walks the doubly-linked list at `+0x40`, inserts a node, returns `1` on insert / `-1` when there is no widget |
+
+So the object is 152 bytes and the field map above fits inside it exactly, and `+0x40` is a
+doubly-linked **list head** — the widget's children. That list is the closest thing to a widget
+registry found so far.
+
+### A reachability problem worth recording
+
+None of `0x00067B18`, `0x000677E0`, `0x00067834`, `0x00067BD0` or `0x00067C18` has a direct
+`jal` caller, a data pointer anywhere in either loadable segment, or an address materialised
+in code — with one exception: `0x00067C18` materialises `0x00067B18` and `0x00067BB8` while
+allocating an object, and even that constructor has no caller.
+
+Two readings remain, and static analysis alone cannot separate them:
+
+1. the chain is reached from a per-stage PRX overlay through a mechanism not yet mapped, or
+2. the whole cluster is development leftover that the retail build never executes.
+
+The second would be consistent with the debug/overlay cluster noted above, and it would mean
+option B (writing `+0x7C` directly) has no proven live target. It also means the field map in
+this document is a *reconstruction of a data structure*, not proof that it is populated at
+runtime. Confirming it needs execution, not more static reading: patch the recompiled binary
+to log whether `0x00067834` is entered during a normal list interaction.
+
 This is the component to study for board scrolling and hand browsing, and it is the reason a
 tap cannot be treated as an absolute position: the engine models *movement*, not coordinates.
 
@@ -166,10 +207,17 @@ manageable 5 KB window for a focused read.
 | move a list quickly | yes | hold the direction; the engine repeats at step 4 after 21 frames |
 | drag a board camera | likely | push `Lx`/`Ly` past the ±30 dead zone |
 | tap an absolute board tile | **no, not yet** | the engine has no absolute cursor; a tap must be translated into a movement sequence |
-| jump a list to an absolute index | maybe | write the widget's `+0x7C` index, but the widget object address is dynamic per screen |
+| jump a list to an absolute index | **unproven** | write the widget's `+0x7C` index; `0x00076C6C` gives the object, but the cluster may be unreachable (see above) |
 
-The last two rows are the real remaining work, and both need the same thing: knowing which
-widget object owns the focused element at any given moment.
+The bottom two rows are where the remaining work is, and they are no longer the same problem.
+Tap-to-tile is a translation layer — coordinate in, dpad sequence out — and it needs the board's
+camera and tile geometry, not more engine knowledge. Index injection is blocked on the
+reachability question above.
+
+The practical consequence: **option A is the architecture**. Pulsing buttons at
+`sceCtrlReadBufferPositive` reaches every screen the engine has, needs no per-screen knowledge,
+and is the only path proven to work. Option B stays a possible optimisation for one screen at a
+time, and only after execution proves the widget object exists at runtime.
 
 ## Open items
 
@@ -177,4 +225,6 @@ widget object owns the focused element at any given moment.
 - Identify the debug/overlay cluster (`0x00002B70`, `0x00002CE8`, `0x00004410`, `0x00007F78`)
   and whether retail builds expose it.
 - Confirm the role of `CIRCLE` in gameplay screens (`0x000AB86C`, `0x000AE9AC`).
-- Locate the widget registry so a tap can resolve "which list is on screen".
+- Settle the widget reachability question by execution: log whether `0x00067834` is entered
+  during a normal list interaction in the recompiled build.
+- Map the board camera and tile geometry, which is what a tap-to-tile translation layer needs.
