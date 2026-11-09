@@ -143,7 +143,82 @@ This is why gesture mapping is cheap: a tap on a card becomes "CROSS pressed for
 a drag on the board becomes "d-pad held in direction D with magnitude", and the engine's own
 repeat logic handles rate limiting. No per-screen patching, no state injection.
 
+## Key layer — the API the game actually reads
+
+The pad array is not read by game logic. It is consumed by a per-player "key" state that adds
+edge detection, and that is what the UI polls.
+
+`0x00074C84  key_update(key *k, pad *p)`:
+
+```
+old = k->buttons;                       // 0x00074C9C
+k->buttons = p->buttons;                // p+0x0C
+k->axes    = p->axes;                   // p+0x10..0x13, packed
+k->btn[0..3]  = p->btn[0..3];
+k->btn[4..7]  = p->btn[4..7];
+k->btn[8..11] = p->btn[8..11];
+0x00074A9C(k, p);                       // axis shaping
+new = k->buttons;
+k->pressed  = new & ~old;               // 0x00074CE0
+k->released = old & ~new;               // 0x00074CE4
+```
+
+Key array: `0x00094B0C`, **2 entries of `0x24`**, updated from `0x00074EB4` for both slots.
+
+| Offset | Type | Meaning |
+|---|---|---|
+| `+0x00` | u32 | buttons (game-internal bits, see above) |
+| `+0x04` | u32 | packed axes `rx \| ry<<8 \| lx<<16 \| ly<<24` |
+| `+0x08` | u32 | `btn[0..3]` — up, right, down, left |
+| `+0x0C` | u32 | `btn[4..7]` — `_`, `_`, L, R |
+| `+0x10` | u32 | `btn[8..11]` — triangle, circle, cross, square |
+| `+0x14` | u32 | **pressed** this frame (`new & ~old`) |
+| `+0x18` | u32 | **released** this frame (`old & ~new`) |
+| `+0x1C` | u32 | copied from `pad+0x20` |
+| `+0x1E` | u16 | per-player flags, gated by game code |
+
+Public accessors for the edge words:
+
+| Address | Returns |
+|---|---|
+| `0x000FBEA4` | `key[i] + 0x14` — pressed |
+| `0x000FBEC4` | `key[i] + 0x18` — released |
+
+Both fall back to a global at `0x000839E4` when the flag byte at `0x000839E0` is zero, so a
+host that never fills the key array still gets a defined value.
+
+Game code flips input-enable bits in `key[i]+0x1E` at `0x0000191C`, `0x00001C4C`,
+`0x00002BCC`, `0x00002D1C`, `0x0000444C`, `0x00117798`, `0x0011786C` — that is how screens
+lock and unlock input. A touch layer must not fight it.
+
+A second device registry sits at `0x00077544` (stride `0x28`) with attach/detach setters at
+`0x00074D00` (flag `0x10`), `0x00074D88` (flag `0x08`), `0x00074E10` (flag `0x1000`, copies a
+six-word descriptor) and `0x00074D44` / `0x00074DCC` for detach.
+
+## The analog stick is used
+
+This is the difference between "touch replaces buttons" and "touch replaces buttons and a
+cursor". `0x00008060` reads it directly:
+
+```
+lbu a1, 6(key0)          // Lx
+lbu v0, 7(key0)          // Ly
+x = a1 - 128
+y = v0 - 128
+if (x < -30) x = a1 - 98        // dead zone, ±30
+else if (x < 31) x = 0
+...same shaping for y...
+```
+
+So the game treats the stick as a signed offset from centre with a **±30 dead zone**, and stores
+the shaped value for the cursor/animation code.
+
+Auto-repeat also lives here: `0x000677E0` watches `key[0].buttons`, and if the same value holds
+for **21 frames** it switches to a repeat state. The rate limit is therefore the engine's, not
+the touch layer's.
+
 ## Where the seam sits in the port
+
 
 ```
 Android touch  ->  gesture recognizer  ->  SceCtrlData{buttons, Lx, Ly}
@@ -156,13 +231,29 @@ Android touch  ->  gesture recognizer  ->  SceCtrlData{buttons, Lx, Ly}
 
 Only the first two boxes are new code. Everything below the seam is the recompiled original.
 
+Because the analog stick is live and the engine owns repeat timing, the touch layer can be
+built without any per-screen patching:
+
+| Gesture | Injection |
+|---|---|
+| tap a card / tile | set the confirming button (usually `CROSS`) for 2–4 frames, release |
+| tap a menu entry | same, with `CROSS` |
+| drag the board | hold a direction, or push `Lx`/`Ly` past the ±30 dead zone |
+| cancel | `CROSS` + `TRIANGLE`, whatever the screen expects |
+| card detail / rotate | `SQUARE` / `L` / `R` |
+
+The only piece that still needs game-specific work is a **screen-aware mapping**: a tap on a
+board tile has to become the movement sequence that walks the cursor there, because the engine
+only understands direction, not absolute position. That is the state machine document.
+
+
 ## Open items
 
-- Semantics of the `+0x3D` flag written by `0x00075120`.
-- The two `0x24`-byte handler states at `0x00094B54`/`0x00094B78` consumed by
-  `0x00074EB4` (edge detection and repeat timing constants).
-- Which internal button bits the hand/targeting screens poll, i.e. the UI state machine that
-  decides what a tap means. That is the next document, and it is game code, not platform code.
+- Semantics of the `+0x3C` and `+0x3D` flags written by `0x00075108` / `0x00075120`.
+- Which flag bit in `key[i]+0x1E` maps to which screen lock (bits `0x01`, `0x02`, `0x04`,
+  `0x08`, `0x10`, `0x1000` are all written by game code).
+- Which internal button bits each UI screen polls, i.e. the state machine that decides what a
+  tap means. That is game logic, not platform code, and it is the next document.
 
 ## Reproduction
 
