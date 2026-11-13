@@ -72,3 +72,30 @@ this phase. The deliverable is the measurement, not playability.
   - Not met: nothing renders (no GE consumer; 6,103 of 6,364 GE words per frame are NOP), encrypted
     `~PSP` modules are substituted rather than executed, and `--max` does not bound dispatches at
     the value given.
+
+- **L3** — the sound-init deadlock is gone. Root cause was a host ABI bug, not the guest.
+  - The L2 lead about eight unregistered `jr $ra` slots is **refuted**: the loader registers all 79
+    imports with stub offsets spanning `0x7744..0x138B4`, so those eight slots are covered. They are
+    the `kjfs` imports `0xC78E5271` mount, `0x93E9297F` open, `0x1ECF095D`, `0x1B969771`,
+    `0x432F631B` read, `0x2B9B31B4` close, `0x813E06AD`, `0xCD04902E`.
+  - `sound.prx` `module+0x5CAC` is correct guest code: `seek(fd,0,SEEK_CUR)` saves the position,
+    `read(fd,buf,size)`, and on a short read it rewinds with `seek(fd,saved,SEEK_SET)` and retries.
+    It looped forever because the rewind target was wrong, not because it was stuck.
+  - `sceIoLseek(fd, SceOff offset, int whence)` puts the 64-bit offset on an even register pair:
+    `a2:a3` (low in `a2`), `whence` in `t0`, and `a1` is padding. Two independent proofs from the
+    image: `kjfs+0xC54` rebuilds `a0/a2/a3/t0` and never touches `a1`; and its caller at
+    `sound+0x5C94` sets only `a2`/`a3`/`t0`, leaving `a1` as stale garbage on purpose.
+  - The binding decoded `(a1<<32)|a2` and `whence` from `a3`. Every seek therefore got a garbage
+    offset, and the clamp to `file->size` turned that garbage into a plausible `792724`, so the
+    guest faithfully rewound to EOF and every read returned 0. The clamp is removed: a seek past
+    EOF is legal and only makes the next read return zero.
+  - Evidence after the fix: `0x432F631B` (read) returns `0x000C1894` instead of 0, the completion
+    callback `0x53E8` fires, `Main` leaves sema 41 and keeps calling `sound::0x531B15D1`, and the
+    run ends on the dispatch limit instead of a deadlock: 1,306,820 dispatches, 2,068 frames,
+    1,034 GE lists queued, guest time 34,649 ms.
+  - The game now opens the assets it needs: `stage/init` (3,338,158 bytes), `mgp_stage.prx`, and
+    the two streams at `sce_lbn0x1bc30` (792,724 bytes) and `sce_lbn0x1c8c0` (916,419 bytes).
+  - Still open: the GE lists are empty. List #1 (`0x0893CA60`, 220 words) carries real commands;
+    the lists enqueued from `ra=0x08923164` (`0x499E1000`, `0x489B8880`) are 2,048 zero words each.
+    The uncached-alias theory is refuted: `GuestMemory::canonical` (`& 0x1FFFFFFF`) already maps
+    both aliases to the same physical window.

@@ -997,9 +997,20 @@ std::size_t load_prx_module_impl(Runtime &runtime, psprecomp::Elf32Image image, 
               << " relocations=" << relocations.total << " imports=" << imports.size() << " exports=" << export_count
               << "\n"
               << std::flush;
+    // Temporary: an export is the only way to name what a module does when the guest calls it by
+    // NID. Printing the table turns a `jal` into module code into a named function.
+    if (module.name == "KCEJ_FS") {
+        for (const auto &library : module.exports) {
+            for (const auto &entry : library.second) {
+                std::cout << "[kjfs] export " << library.first << "::" << hex32(entry.first)
+                          << " at +" << hex32(entry.second - base) << "\n";
+            }
+        }
+        std::cout << std::flush;
+    }
     // Temporary: an import whose stub stayed a bare `jr ra` is invisible at run time, so name
     // every stub of a module under investigation along with the call it stands for.
-    if (module.name == "KCEJ_SOUND") {
+    if (module.name == "KCEJ_SOUND" || module.name == "KCEJ_FS") {
         for (const auto &import : imports) {
             const bool bound = g_host.bound_imports.find(import.library + ":" + hex32(import.nid)) !=
                                g_host.bound_imports.end();
@@ -1313,10 +1324,22 @@ void module_return_sentinel(Runtime &runtime, AllegrexContext &ctx) {
         }
         // Temporary: how the sound library answers the call that just returned, so a request
         // whose completion is lost names its own return value.
-        if (frame.nid == 0x531B15D1u || frame.nid == 0xEBDDA65Cu) {
-            GuestThread *self = current_thread();
+        if (frame.nid == 0x531B15D1u || frame.nid == 0xEBDDA65Cu) {            GuestThread *self = current_thread();
             std::cout << "[sound] return " << hex32(frame.nid) << " v0=" << hex32(result)
                       << " by='" << (self == nullptr ? "?" : self->name) << "'\n" << std::flush;
+        }
+        // Temporary: the streaming reader in KCEJ_FS is entered with a descriptor, a buffer and a
+        // length and comes back without calling sceIoRead at all. Its own return value says whether
+        // it refused the request or reported a short read, and that is the difference between a
+        // bad argument and a bad file.
+        if (frame.nid == 0x432F631Bu || frame.nid == 0x1ECF095Du) {
+            static int shown = 0;
+            if (shown < 40) {
+                ++shown;
+                GuestThread *self = current_thread();
+                std::cout << "[kjfs] " << hex32(frame.nid) << " -> " << hex32(result) << " by='"
+                          << (self == nullptr ? "?" : self->name) << "'\n" << std::flush;
+            }
         }
         ctx.pc = frame.return_ra;
         break;
@@ -1992,6 +2015,14 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     bind("IoFileMgrForUser", 0x6A638D83u, "sceIoRead", [](Runtime &runtime, AllegrexContext &ctx) {
         GuestFile *file = find_file(ctx.gpr[4]);
         if (file == nullptr) {
+            // Temporary: a descriptor the host never issued is the difference between a module
+            // reading its own handle and a caller that was handed the wrong one.
+            static unsigned unknown = 0;
+            if (unknown < 20u) {
+                ++unknown;
+                std::cout << "[io]    read of unknown fd=" << ctx.gpr[4] << " size=" << ctx.gpr[6]
+                          << " caller=" << hex32(ctx.gpr[31]) << "\n" << std::flush;
+            }
             ctx.gpr[2] = 0x80010009u;  // SCE_KERNEL_ERROR_EBADF
             return;
         }
@@ -2039,14 +2070,30 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             ctx.gpr[3] = 0u;
             return;
         }
+        // sceIoLseek(fd, SceOff offset, int whence): the 64-bit offset lands on an even register
+        // pair, so it is a2:a3 (low word in a2) and `whence` is pushed out to a4/t0. a1 is padding
+        // and is never read. kjfs+0xC54 proves it: its seek wrapper rebuilds a0/a2/a3/t0 from its
+        // own arguments and deliberately leaves a1 alone.
         const std::int64_t offset = static_cast<std::int64_t>(
-            (static_cast<std::uint64_t>(ctx.gpr[6]) << 32u) | ctx.gpr[5]);
+            (static_cast<std::uint64_t>(ctx.gpr[7]) << 32u) | ctx.gpr[6]);
+        const std::uint32_t whence = ctx.gpr[8];
         std::int64_t base = 0;
-        if (ctx.gpr[7] == 1u) base = static_cast<std::int64_t>(file->position);
-        if (ctx.gpr[7] == 2u) base = static_cast<std::int64_t>(file->size);
-        std::int64_t target = base + offset;
-        if (target < 0) target = 0;
-        if (target > static_cast<std::int64_t>(file->size)) target = static_cast<std::int64_t>(file->size);
+        if (whence == 1u) base = static_cast<std::int64_t>(file->position);
+        if (whence == 2u) base = static_cast<std::int64_t>(file->size);
+        // A seek past the end of the file is legal on the PSP and only makes the next read return
+        // zero, so the position is stored as asked. Clamping it to the file size is what turned a
+        // garbage offset into a plausible-looking result and hid the ABI bug.
+        if (whence > 2u) {
+            ctx.gpr[2] = 0x80010016u;  // SCE_KERNEL_ERROR_EINVAL
+            ctx.gpr[3] = 0u;
+            return;
+        }
+        const std::int64_t target = base + offset;
+        if (target < 0) {
+            ctx.gpr[2] = 0x80010016u;
+            ctx.gpr[3] = 0u;
+            return;
+        }
         file->position = static_cast<std::uint64_t>(target);
         file->stream.clear();
         file->stream.seekg(static_cast<std::streamoff>(file->base_offset + file->position), std::ios::beg);
@@ -2063,8 +2110,8 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         }
         if (file->base_offset != 0u && *seeks < 10u) {
             ++*seeks;
-            std::cout << "[iso]  seek fd=" << file->uid << " off=" << offset << " hi=" << ctx.gpr[6]
-                      << " whence=" << ctx.gpr[7] << " -> " << file->position << " caller=" << hex32(ctx.gpr[31])
+            std::cout << "[iso]  seek fd=" << file->uid << " off=" << offset << " hi=" << ctx.gpr[7]
+                      << " whence=" << whence << " -> " << file->position << " caller=" << hex32(ctx.gpr[31])
                       << "\n";
         }
         ctx.gpr[2] = static_cast<std::uint32_t>(file->position);
