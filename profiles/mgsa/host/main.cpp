@@ -20,8 +20,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -139,6 +141,11 @@ struct GuestFile {
     // file; the ISO9660 sector for a raw "disc0:/sce_lbn..." handle.
     std::uint64_t base_offset{};
     std::string path;
+    // Temporary: a partially read asset is a silent load failure. Totals per descriptor say
+    // whether the guest stopped early or the log simply stopped printing.
+    std::uint64_t reads{};
+    std::uint64_t bytes_read{};
+    std::uint64_t max_position{};
 };
 
 // One open directory, snapshotted at sceIoDopen so a recursive walk cannot shift under itself.
@@ -245,6 +252,14 @@ struct Host {
     std::vector<IntrHandler> queued_interrupts;
     bool interrupt_chain_active{};
     std::uint32_t vblank_count{};
+    std::uint32_t press_mask{};
+    std::uint32_t press_from{300u};
+    std::uint32_t press_seen{};
+    std::unordered_map<std::uint32_t, std::uint64_t> vblank_callers;
+    std::uint64_t last_ram_hash{};
+    std::size_t ram_hash_changes{};
+    std::uint64_t last_vram_hash{};
+    std::size_t vram_hash_changes{};
     std::vector<GuestFile> files;
     std::vector<GuestDir> dirs;
     std::unordered_map<std::string, std::uint32_t> opened_paths;
@@ -297,6 +312,13 @@ struct Host {
     // returns the guest's own value instead of a fabricated zero.
     std::uint32_t next_ge_list_id{1};
     std::unordered_map<std::uint32_t, std::uint32_t> ge_stall;
+    // Where each list starts. ge_stall is overwritten by every update, so it cannot answer
+    // "walk the list from its beginning to the current stall".
+    std::unordered_map<std::uint32_t, std::uint32_t> ge_list_start;
+    std::unordered_map<std::uint32_t, std::uint64_t> ge_list_max_draws;
+    std::uint64_t ge_incremental_walks{};
+    std::uint64_t ge_incremental_draws{};
+    std::uint64_t ge_incremental_vertices{};
     std::uint64_t ge_lists_queued{};
     // Temporary: the GE command bytes the guest submits, so "is it drawing?" is measured
     // from the display lists instead of assumed from the frame count.
@@ -313,6 +335,12 @@ struct Host {
     std::uint64_t ge_walk_unfinished{};
     std::uint64_t ge_walk_max_draws{};
     std::uint64_t ge_walk_max_vertices{};
+    // Temporary: how many times each import is called. A steady state that draws one sprite
+    // forever is either polling for something or waiting on something, and the call histogram
+    // is the only place that difference is visible from the host.
+    std::unordered_map<std::string, std::uint64_t> import_calls;
+    std::uint64_t steady_imports{};
+    std::unordered_map<std::string, std::uint64_t> steady_import_calls;
 
     bool widget_seen[std::size(kWidgetProbes)]{};
     std::size_t widget_hits{};
@@ -397,11 +425,64 @@ void enter_queued_interrupt(AllegrexContext &ctx) {
 // The first handler takes over ctx.pc, so the import wrapper that called this binding leaves that
 // pc alone and the runtime dispatches into guest code. Control comes back through
 // kModuleReturnSentinel, which resumes the next queued handler or returns to the wait.
-void advance_vblank(Runtime &, AllegrexContext &ctx) {
+// Makes ready every thread whose delay has expired. A sleeping thread must be woken by time
+// passing, not only by another thread blocking, so schedule() calls this after advancing the
+// clock and every other time source is expected to call it too.
+void wake_expired_delays();
+
+void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     ++g_host.vblank_count;
     // One frame of guest time. Without this the guest's own clock runs hundreds of times
     // too slow, so every deadline, timeout and audio position it computes is wrong.
     g_host.virtual_us += kFramePeriodUs;
+    // A pulse, not a hold: the guest reads the buffer once per frame, and a button that never
+    // goes up looks the same as one that was never pressed.
+    if (g_host.press_mask != 0u && g_host.vblank_count >= g_host.press_from) {
+        g_host.input.buttons = (g_host.vblank_count & 2u) != 0u ? g_host.press_mask : 0u;
+    }
+    // Temporary: a sampled hash of guest RAM. A screen that never changes is either a frozen
+    // guest or a guest working on something invisible, and this separates the two.
+    if (g_host.vblank_count % 60u == 0u) {
+        const psprecomp::GuestMemory &memory = runtime.memory();
+        std::uint64_t hash = 1469598103934665603ull;
+        for (std::uint32_t address = 0x08800000u; address < 0x0A000000u; address += 256u) {
+            if (!memory.contains(address, 4u)) continue;
+            hash ^= memory.aot_load32(address);
+            hash *= 1099511628211ull;
+        }
+        if (hash != g_host.last_ram_hash) {
+            g_host.last_ram_hash = hash;
+            ++g_host.ram_hash_changes;
+            if (g_host.ram_hash_changes <= 8u || g_host.ram_hash_changes % 20u == 0u) {
+                std::cout << "[ram] frame " << g_host.vblank_count << " hash=" << std::hex << hash << std::dec
+                          << " changes=" << g_host.ram_hash_changes << "\n"
+                          << std::flush;
+            }
+        }
+        // VRAM is a separate region, so a CPU-side blit into the framebuffer is invisible to the
+        // RAM hash above. Hashing it too is the only way to tell "nothing is drawn" from "the
+        // guest draws without the GE".
+        const std::vector<std::uint8_t> &vram = memory.vram_bytes();
+        std::uint64_t vram_hash = 1469598103934665603ull;
+        std::size_t non_zero = 0u;
+        for (std::size_t i = 0u; i + 4u <= vram.size(); i += 4u) {
+            std::uint32_t word = 0u;
+            std::memcpy(&word, vram.data() + i, 4u);
+            if (word != 0u) ++non_zero;
+            vram_hash ^= word;
+            vram_hash *= 1099511628211ull;
+        }
+        if (vram_hash != g_host.last_vram_hash) {
+            g_host.last_vram_hash = vram_hash;
+            ++g_host.vram_hash_changes;
+            if (g_host.vram_hash_changes <= 8u || g_host.vram_hash_changes % 20u == 0u) {
+                std::cout << "[vram] frame " << g_host.vblank_count << " hash=" << std::hex << vram_hash
+                          << std::dec << " changes=" << g_host.vram_hash_changes << " non_zero_words=" << non_zero
+                          << "/" << (vram.size() / 4u) << "\n"
+                          << std::flush;
+            }
+        }
+    }
     // A handler that itself waits for vblank must not recurse into a second chain; that wait
     // returns normally and the frame already in progress finishes its handlers.
     if (g_host.interrupt_chain_active) return;
@@ -529,6 +610,20 @@ void switch_to(AllegrexContext &ctx, GuestThread &thread) {
     psprecomp::set_runtime_thread_identity(static_cast<std::int32_t>(thread.uid), thread.name);
 }
 
+// Makes ready every thread whose delay has expired. A sleeping thread must be woken by time
+// passing, not only by another thread blocking, so schedule() calls this after advancing the
+// clock and every other time source is expected to call it too.
+void wake_expired_delays() {
+    for (auto &thread : g_host.threads) {
+        if (thread.state != ThreadState::Waiting) continue;
+        if (thread.wait_kind != WaitKind::Delay && thread.wait_kind != WaitKind::Sleep) continue;
+        if (thread.wait_kind == WaitKind::Sleep && !thread.waiting_on_wakeup) continue;
+        if (thread.wait_deadline_us > g_host.virtual_us) continue;
+        thread.context.gpr[2] = 0u;
+        make_ready(thread);
+    }
+}
+
 // Runs the best runnable thread. Virtual time moves only when nothing can run: a sleeping thread
 // does not stop a ready one, so the clock is advanced to the earliest deadline only after every
 // thread has been ruled out. With nothing runnable and no deadline the run has no future, so it
@@ -556,14 +651,7 @@ void schedule(Runtime &runtime, AllegrexContext &ctx) {
             g_host.virtual_us = earliest;
             ++g_host.progress_epoch;
         }
-        for (auto &thread : g_host.threads) {
-            if (thread.state != ThreadState::Waiting) continue;
-            if (thread.wait_kind != WaitKind::Delay && thread.wait_kind != WaitKind::Sleep) continue;
-            if (thread.wait_deadline_us > g_host.virtual_us) continue;
-            if (thread.wait_kind == WaitKind::Sleep && !thread.waiting_on_wakeup) continue;
-            thread.context.gpr[2] = 0u;
-            make_ready(thread);
-        }
+        wake_expired_delays();
     }
     // Nothing runnable and nothing timable: report the block instead of looping.
     std::string report = "scheduler deadlock: no runnable thread";
@@ -613,6 +701,16 @@ void block_current(Runtime &runtime, AllegrexContext &ctx, WaitKind kind, std::u
 // Runs after every HLE import. It charges a little virtual time and, once the slice is spent,
 // hands the CPU to an equal-or-higher-priority ready thread. Higher-priority threads always
 // preempt immediately, as on the PSP.
+void note_import_call(const std::string &label) {
+    ++g_host.import_calls[label];
+    // The steady state is what matters: the boot chain's traffic says nothing about what the
+    // game does once it is presenting frames.
+    if (g_host.vblank_count >= 600u) {
+        ++g_host.steady_imports;
+        ++g_host.steady_import_calls[label];
+    }
+}
+
 void after_import(Runtime &runtime, AllegrexContext &ctx) {
     if (g_host.skip_post_import) {
         g_host.skip_post_import = false;
@@ -672,7 +770,12 @@ void wake_sema_waiters(const GuestSema &sema) {
 constexpr std::uint32_t kThreadExitStub = 0x08800000u;
 
 void thread_exit_stub(Runtime &runtime, AllegrexContext &ctx) {
-    if (GuestThread *thread = current_thread()) thread->state = ThreadState::Dead;
+    if (GuestThread *thread = current_thread()) {
+        thread->state = ThreadState::Dead;
+        std::cout << "[exit] frame " << g_host.vblank_count << " uid=" << thread->uid << " '" << thread->name
+                  << "' returned to the exit stub from pc=" << hex32(ctx.gpr[31]) << "\n"
+                  << std::flush;
+    }
     g_host.current_thread_uid = 0u;
     ctx.gpr[2] = 0u;
     schedule(runtime, ctx);
@@ -1153,6 +1256,19 @@ Runtime::HleFunction make_prx_export_forwarder(std::string library, std::uint32_
         }
         enter_guest_code(runtime, ctx, g_host.modules[index], address->second, FrameKind::Export, 0u);
         frame_stack().back().nid = nid;
+        // Temporary: which guest code calls into each module export, and when. The title archive
+        // is opened at frame 36 by kjfs, and the caller's ra is the only way back to the game
+        // function that owns that load.
+        {
+            static std::map<std::pair<std::string, std::uint32_t>, unsigned> seen;
+            auto &count = seen[{library, nid}];
+            if (count < 3u && ctx.gpr[31] != 0x09FFF000u) {
+                ++count;
+                std::cout << "[call] frame=" << g_host.vblank_count << " " << g_host.modules[index].name
+                          << "::" << hex32(nid) << " caller=" << hex32(ctx.gpr[31]) << "\n"
+                          << std::flush;
+            }
+        }
         // Temporary: the sound library's asynchronous contract. A call that hands the module a
         // completion callback must either return a result the caller can observe or call that
         // callback; anything else is a request the host swallowed.
@@ -1278,6 +1394,7 @@ void prx_import_thunk(Runtime &runtime, AllegrexContext &ctx) {
     }
     // Copied: resolving a module export can load a provider, which grows prx_imports.
     const PrxImportSite import = g_host.prx_imports[stub->second];
+    note_import_call(import.library + "::" + hex32(import.nid));
     const std::uint32_t return_address = ctx.gpr[31];
     // Temporary: keep the last few imports so a fault can be traced to the host call before it.
     if (g_host.recent_imports.size() >= 40u) g_host.recent_imports.erase(g_host.recent_imports.begin());
@@ -1384,9 +1501,30 @@ struct GeListWalk {
     std::uint32_t first_call_resolved{};
     bool first_call_used_base{};
     std::uint32_t first_outside_pc{};
+    // The state the first primitive is drawn with. Counting draws says the game submits work;
+    // these fields say what that work actually is, which is the only way to tell a loading
+    // fade from a scene without a renderer.
+    std::uint32_t prim{};
+    std::uint32_t vertex_address{};
+    std::uint32_t vertex_type{};
+    std::uint32_t texture_address{};
+    std::uint32_t texture_format{};
+    std::uint32_t texture_size{};
+    std::uint32_t texture_buffer_width{};
+    std::uint32_t texture_mode{};
+    std::uint32_t texture_function{};
+    std::uint32_t texture_enabled{};
+    std::uint32_t scissor_top_left{};
+    std::uint32_t scissor_bottom_right{};
+    std::uint32_t offset_x{};
+    std::uint32_t offset_y{};
+    std::uint32_t prim_pc{};
+    std::array<std::uint32_t, 16> vertex_words{};
+    std::size_t vertex_words_read{};
+    bool stopped_at_limit{};
 };
 
-GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t start) {
+GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t start, std::uint32_t limit = 0u) {
     GeListWalk walk;
     std::uint32_t pc = start;
     // The GE encodes one word per command: the top byte names it and the low 24 bits carry
@@ -1398,7 +1536,26 @@ GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t star
         return (offset_address + (base_extended | (data & 0x00FFFFFFu))) & 0x0FFFFFFFu;
     };
     std::vector<std::uint32_t> returns;
+    std::uint32_t vertex_address = 0u;
+    std::uint32_t vertex_type = 0u;
+    std::uint32_t texture_address = 0u;
+    std::uint32_t texture_format = 0u;
+    std::uint32_t texture_size = 0u;
+    std::uint32_t texture_buffer_width = 0u;
+    std::uint32_t texture_mode = 0u;
+    std::uint32_t texture_function = 0u;
+    std::uint32_t texture_enabled = 0u;
+    std::uint32_t scissor_top_left = 0u;
+    std::uint32_t scissor_bottom_right = 0u;
+    std::uint32_t offset_x = 0u;
+    std::uint32_t offset_y = 0u;
     for (std::size_t step = 0u; step < 400000u; ++step) {
+        // A list the guest is still building has no END yet: the stall address is how far the
+        // GE is allowed to read. Stopping there is what makes an incremental submit measurable.
+        if (limit != 0u && pc == limit) {
+            walk.stopped_at_limit = true;
+            return walk;
+        }
         if (!memory.contains(pc, 4u)) {
             ++walk.outside;
             if (walk.first_outside_pc == 0u) walk.first_outside_pc = pc;
@@ -1414,11 +1571,90 @@ GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t star
             base_extended = (data & 0x000F0000u) << 8u;
             continue;
         }
+        if (command == 0x13u) {  // OFFSET_ADDR
+            offset_address = data << 8u;
+            continue;
+        }
         if (command == 0x14u) {  // ORIGIN
             offset_address = here;
             continue;
         }
+        if (command == 0x01u) {  // VADDR
+            vertex_address = relative(data);
+            continue;
+        }
+        if (command == 0x12u) {  // VERTEXTYPE
+            vertex_type = data;
+            continue;
+        }
+        if (command == 0x1Eu) {  // TEXTURE_MAP_ENABLE
+            texture_enabled = data & 1u;
+            continue;
+        }
+        if (command == 0xA0u) {
+            texture_address = relative(data);
+            continue;
+        }
+        if (command == 0xB8u) {
+            texture_size = data;
+            continue;
+        }
+        if (command == 0xA8u) {
+            texture_buffer_width = data;
+            continue;
+        }
+        if (command == 0xC2u) {
+            texture_mode = data;
+            continue;
+        }
+        if (command == 0xC3u) {
+            texture_format = data;
+            continue;
+        }
+        if (command == 0xC9u) {
+            texture_function = data;
+            continue;
+        }
+        if (command == 0xD4u) {
+            scissor_top_left = data;
+            continue;
+        }
+        if (command == 0xD5u) {
+            scissor_bottom_right = data;
+            continue;
+        }
+        if (command == 0x4Cu) {
+            offset_x = data;
+            continue;
+        }
+        if (command == 0x4Du) {
+            offset_y = data;
+            continue;
+        }
         if (command == 0x04u) {  // PRIM: the low 16 bits are the vertex count
+            if (walk.draws == 0u) {
+                walk.prim = word;
+                walk.prim_pc = here;
+                walk.vertex_address = vertex_address;
+                walk.vertex_type = vertex_type;
+                walk.texture_address = texture_address;
+                walk.texture_format = texture_format;
+                walk.texture_size = texture_size;
+                walk.texture_buffer_width = texture_buffer_width;
+                walk.texture_mode = texture_mode;
+                walk.texture_function = texture_function;
+                walk.texture_enabled = texture_enabled;
+                walk.scissor_top_left = scissor_top_left;
+                walk.scissor_bottom_right = scissor_bottom_right;
+                walk.offset_x = offset_x;
+                walk.offset_y = offset_y;
+                for (std::size_t i = 0u; i < walk.vertex_words.size(); ++i) {
+                    const std::uint32_t address = vertex_address + static_cast<std::uint32_t>(i * 4u);
+                    if (!memory.contains(address, 4u)) break;
+                    walk.vertex_words[i] = memory.aot_load32(address);
+                    ++walk.vertex_words_read;
+                }
+            }
             ++walk.draws;
             walk.vertices += data & 0xFFFFu;
             continue;
@@ -1473,6 +1709,7 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         std::function<void(Runtime &, AllegrexContext &)> scheduled =
             [fn = std::move(fn), label = std::string(library) + ":" + hex32(nid) + " " + name](
                 Runtime &rt, AllegrexContext &ctx) {
+                note_import_call(label);
                 fn(rt, ctx);
                 if (rt.stopped()) return;
                 after_import(rt, ctx);
@@ -1568,14 +1805,24 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     });
     bind("ThreadManForUser", 0xAA73C935u, "sceKernelExitThread", [](Runtime &runtime, AllegrexContext &ctx) {
         GuestThread *thread = current_thread();
-        if (thread != nullptr) thread->state = ThreadState::Dead;
+        if (thread != nullptr) {
+            thread->state = ThreadState::Dead;
+            std::cout << "[exit] frame " << g_host.vblank_count << " uid=" << thread->uid << " '" << thread->name
+                      << "' called sceKernelExitThread from pc=" << hex32(ctx.gpr[31]) << "\n"
+                      << std::flush;
+        }
         g_host.current_thread_uid = 0u;
         ctx.gpr[2] = 0u;
         schedule(runtime, ctx);
     });
     bind("ThreadManForUser", 0x809CE29Bu, "sceKernelExitDeleteThread", [](Runtime &runtime, AllegrexContext &ctx) {
         GuestThread *thread = current_thread();
-        if (thread != nullptr) thread->state = ThreadState::Dead;
+        if (thread != nullptr) {
+            thread->state = ThreadState::Dead;
+            std::cout << "[exit] frame " << g_host.vblank_count << " uid=" << thread->uid << " '" << thread->name
+                      << "' called sceKernelExitDeleteThread from pc=" << hex32(ctx.gpr[31]) << "\n"
+                      << std::flush;
+        }
         g_host.current_thread_uid = 0u;
         ctx.gpr[2] = 0u;
         schedule(runtime, ctx);
@@ -2081,8 +2328,9 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             file.size = std::min<std::uint64_t>(raw_size, available - file.base_offset);
             file.path = path;
             if (g_host.opened_paths[path]++ < 4u) {
-                std::cout << "[io]    open \"" << path << "\" -> ISO sector " << hex32(raw_lba) << " size "
-                          << file.size << " fd=" << file.uid << " caller=" << guest_owner(ctx.gpr[31]) << "\n"
+                std::cout << "[io]    open frame=" << g_host.vblank_count << " \"" << path << "\" -> ISO sector "
+                          << hex32(raw_lba) << " size " << file.size << " fd=" << file.uid
+                          << " caller=" << guest_owner(ctx.gpr[31]) << " ra=" << hex32(ctx.gpr[31]) << "\n"
                           << std::flush;
             }
             g_host.files.push_back(std::move(file));
@@ -2156,6 +2404,9 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         chunk.resize(got);
         if (got > 0u) runtime.memory().copy_in(buffer, chunk);
         file->position += got;
+        ++file->reads;
+        file->bytes_read += got;
+        if (file->position > file->max_position) file->max_position = file->position;
         // Temporary: prove a raw ISO window really delivers bytes, and which. An open with no
         // read, or a read that returns nothing, is a silently failing asset load. The budget is
         // per descriptor: a global one hides every file opened after the first busy loader.
@@ -2235,7 +2486,13 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         const std::uint32_t uid = ctx.gpr[4];
         for (auto it = g_host.files.begin(); it != g_host.files.end(); ++it) {
             if (it->uid != uid) continue;
-            std::cout << "[io]    close fd=" << uid << "\n" << std::flush;
+            std::cout << "[io]    close frame=" << g_host.vblank_count << " fd=" << uid << "\n" << std::flush;
+            // Temporary: a descriptor the guest closes before consuming it is a load that went
+            // nowhere. This is the only place the totals survive the handle.
+            std::cout << "[io]    summary fd=" << uid << " reads=" << it->reads << " bytes=" << it->bytes_read
+                      << " size=" << it->size << " max_pos=" << it->max_position << " "
+                      << (it->bytes_read >= it->size ? "complete" : "PARTIAL") << "  " << it->path << "\n"
+                      << std::flush;
             it->stream.close();
             g_host.files.erase(it);
             ctx.gpr[2] = 0u;
@@ -2406,7 +2663,35 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         ctx.gpr[2] = length;
     });
     bind("IoFileMgrForUser", 0xB2A628C1u, "sceIoAssign", [](Runtime &, AllegrexContext &ctx) { ctx.gpr[2] = 0u; });
-    bind("IoFileMgrForUser", 0x54F5FB11u, "sceIoDevctl", [](Runtime &, AllegrexContext &ctx) { ctx.gpr[2] = 0u; });
+    bind("IoFileMgrForUser", 0x54F5FB11u, "sceIoDevctl", [](Runtime &runtime, AllegrexContext &ctx) {
+        // Temporary: a devctl the guest repeats every frame is a poll, and the command word and
+        // its answer are the only way to see what it is waiting for.
+        static std::unordered_set<std::uint32_t> seen;
+        const std::uint32_t device = ctx.gpr[4];
+        const std::uint32_t command = ctx.gpr[5];
+        const std::uint32_t in_ptr = ctx.gpr[6];
+        const std::uint32_t in_len = ctx.gpr[7];
+        const std::uint32_t out_ptr = ctx.gpr[8];
+        const std::uint32_t out_len = ctx.gpr[9];
+        if (seen.size() < 24u && seen.insert(command).second) {
+            std::cout << "[devctl] command=" << hex32(command) << " in=" << hex32(in_ptr) << "/" << in_len
+                      << " out=" << hex32(out_ptr) << "/" << out_len << " dev=" << hex32(device) << " ra="
+                      << hex32(ctx.gpr[31]) << "\n"
+                      << std::flush;
+            if (runtime.memory().contains(device, 16u)) {
+                std::cout << "[devctl]   name=\"" << runtime.memory().read_c_string(device, 64u) << "\"\n"
+                          << std::flush;
+            }
+        }
+        // EXPERIMENT: mgp_stage polls mscmhc0: 0x02025806 every frame and treats out[0] == 1 as
+        // "media present". Writing it answers the only question this host can answer about a
+        // memory stick it does not have, and shows whether the poll gates the game.
+        if (command == 0x02025806u && out_ptr != 0u && out_len >= 4u &&
+            runtime.memory().contains(out_ptr, 4u)) {
+            runtime.memory().store32(out_ptr, 0u);
+        }
+        ctx.gpr[2] = 0u;
+    });
     bind("IoFileMgrForUser", 0x779103A0u, "sceIoRename", [](Runtime &, AllegrexContext &ctx) { ctx.gpr[2] = 0u; });
 
     // --- sceUmdUser: the boot sequence polls the drive before it opens anything.
@@ -2436,6 +2721,13 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         }
         runtime.memory().zero(data, 16u);
         runtime.memory().store32(data + 4u, g_host.input.buttons);
+        // Temporary: prove the injected button reaches the guest, and prove the guest reads it.
+        if (g_host.input.buttons != 0u && g_host.press_seen < 4u) {
+            ++g_host.press_seen;
+            std::cout << "[press] frame " << g_host.vblank_count << " buttons=" << hex32(g_host.input.buttons)
+                      << " -> " << hex32(data) << "\n"
+                      << std::flush;
+        }
         runtime.memory().store8(data + 8u, g_host.input.left_x);
         runtime.memory().store8(data + 9u, g_host.input.left_y);
         runtime.memory().store8(data + 10u, g_host.input.right_x);
@@ -2491,6 +2783,7 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             const std::uint32_t stall = ctx.gpr[5];
             const std::uint32_t id = g_host.next_ge_list_id++;
             g_host.ge_stall[id] = list;  // the list is consumed immediately: stall == start
+            g_host.ge_list_start[id] = list;
             ++g_host.ge_lists_queued;
             // Walk the list as the GE would, every time it is queued. This is the number that
             // says whether a frame draws anything, and it costs one pass over the words.
@@ -2574,6 +2867,24 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
                                 }
                             }
                         }
+                        if (walk.draws != 0u) {
+                            std::cout << "[ge]   draw: prim=" << hex32(walk.prim) << " at "
+                                      << hex32(walk.prim_pc) << " vtype=" << hex32(walk.vertex_type)
+                                      << " vaddr=" << hex32(walk.vertex_address) << " tex_en="
+                                      << walk.texture_enabled << " tex=" << hex32(walk.texture_address)
+                                      << " fmt=" << hex32(walk.texture_format) << " size="
+                                      << hex32(walk.texture_size) << " bufw=" << hex32(walk.texture_buffer_width)
+                                      << " mode=" << hex32(walk.texture_mode) << " func="
+                                      << hex32(walk.texture_function) << "\n";
+                            std::cout << "[ge]   scissor=" << hex32(walk.scissor_top_left) << ".."
+                                      << hex32(walk.scissor_bottom_right) << " offset=" << hex32(walk.offset_x)
+                                      << "," << hex32(walk.offset_y) << "\n";
+                            std::cout << "[ge]   vertices:";
+                            for (std::size_t i = 0u; i < walk.vertex_words_read; ++i) {
+                                std::cout << " " << hex32(walk.vertex_words[i]);
+                            }
+                            std::cout << "\n";
+                        }
                         if (walk.first_outside_pc != 0u) {
                             std::cout << "[ge]   left RAM at " << hex32(walk.first_outside_pc) << "\n";
                         }
@@ -2594,7 +2905,7 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         });
     }
     // sceGeListUpdateStallAddr(list, new_stall) returns the stall address it replaced.
-    bind("sceGe_user", 0xE0D68148u, "sceGeListUpdateStallAddr", [](Runtime &, AllegrexContext &ctx) {
+    bind("sceGe_user", 0xE0D68148u, "sceGeListUpdateStallAddr", [](Runtime &runtime, AllegrexContext &ctx) {
         const std::uint32_t id = ctx.gpr[4];
         const std::uint32_t new_stall = ctx.gpr[5];
         const auto found = g_host.ge_stall.find(id);
@@ -2603,6 +2914,42 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             // a real disagreement between the guest's bookkeeping and the host's, so fail.
             ctx.gpr[2] = 0xFFFFFFFFu;
             return;
+        }
+        // The guest enqueues an empty list and appends to it as the frame is built, telling the
+        // GE how far it may read through this call. Walking from the list start to the new stall
+        // is the only measurement that sees the real frame: the list at enqueue time is empty.
+        const auto start = g_host.ge_list_start.find(id);
+        if (start != g_host.ge_list_start.end() && new_stall > start->second) {
+            const GeListWalk walk = walk_ge_list(runtime.memory(), start->second, new_stall);
+            ++g_host.ge_incremental_walks;
+            g_host.ge_incremental_draws += walk.draws;
+            g_host.ge_incremental_vertices += walk.vertices;
+            std::uint64_t &best = g_host.ge_list_max_draws[id];
+            if (walk.draws > best) {
+                best = walk.draws;
+                if (walk.draws > g_host.ge_walk_max_draws) {
+                    g_host.ge_walk_max_draws = walk.draws;
+                    g_host.ge_walk_max_vertices = walk.vertices;
+                }
+            }
+            // A fade is a quad whose colour moves; a stuck screen is a quad whose colour never
+            // does. Printing each distinct draw state with the frame it first appeared answers
+            // that without a renderer.
+            if (walk.draws != 0u) {
+                static std::set<std::string> seen;
+                static std::size_t printed = 0u;
+                std::ostringstream signature;
+                signature << hex32(walk.prim) << " " << hex32(walk.vertex_type) << " "
+                          << hex32(walk.texture_address) << " " << walk.texture_enabled;
+                for (std::size_t i = 0u; i < walk.vertex_words_read; ++i) {
+                    signature << " " << hex32(walk.vertex_words[i]);
+                }
+                if (seen.insert(signature.str()).second && printed < 12u) {
+                    ++printed;
+                    std::cout << "[ge] frame " << g_host.vblank_count << " draw: " << signature.str() << "\n"
+                              << std::flush;
+                }
+            }
         }
         ctx.gpr[2] = found->second;
         found->second = new_stall;
@@ -2656,6 +3003,10 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     // "wait N frames" loops depend on. Without it they spin forever on a counter nothing writes.
     for (auto nid : {0x984C27E7u, 0x46F186C3u}) {  // WaitVblankStartCB / WaitVblankCB
         bind("sceDisplay", nid, "sceDisplayWaitVblank", [](Runtime &runtime, AllegrexContext &ctx) {
+            // Temporary: who drives the frame loop. A frame counter that advances from one
+            // guest function is a healthy loop; a spread means several subsystems each think
+            // they own the display.
+            if (ctx.gpr[31] != 0u) ++g_host.vblank_callers[ctx.gpr[31]];
             advance_vblank(runtime, ctx);
             // A handler that took over ctx.pc resolves this value through the sentinel, which
             // returns 0 for the interrupted wait; an interrupt-free wait returns 0 here.
@@ -2989,6 +3340,13 @@ int main(int argc, char **argv) {
             g_host.game_root = argv[++i];
         } else if (arg == "--iso" && i + 1 < argc) {
             g_host.iso_path = argv[++i];
+        } else if (arg == "--press" && i + 1 < argc) {
+            // A button the guest would see from a real controller. Pressing it is not a
+            // shortcut: a screen that waits for input is indistinguishable from a frozen
+            // guest until someone presses something.
+            g_host.press_mask = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
+        } else if (arg == "--press-from" && i + 1 < argc) {
+            g_host.press_from = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
         }
     }
     if (g_host.game_root.empty()) g_host.game_root = "extract";
@@ -3131,6 +3489,26 @@ int main(int argc, char **argv) {
                   << " GE lists queued, guest time " << g_host.virtual_us / 1000u << " ms\n";
         std::cout << "--- guest time per frame: "
                   << (g_host.vblank_count == 0u ? 0u : g_host.virtual_us / g_host.vblank_count) << " us\n";
+        {
+            std::vector<std::pair<std::uint32_t, std::uint64_t>> callers(
+                g_host.vblank_callers.begin(), g_host.vblank_callers.end());
+            std::sort(callers.begin(), callers.end(),
+                [](const auto &left, const auto &right) { return left.second > right.second; });
+            std::cout << "--- vblank callers (" << callers.size() << " distinct)\n";
+            for (const auto &caller : callers) {
+                std::cout << "    " << caller.second << "  ra=" << hex32(caller.first) << "\n";
+            }
+        }
+        // Temporary: every descriptor and how much of it was consumed. A file the guest opened
+        // and never finished reading is the cheapest explanation for a screen with nothing on it.
+        {
+            std::cout << "--- files (reads / bytes of size)\n";
+            for (const auto &file : g_host.files) {
+                std::cout << "    fd=" << file.uid << " reads=" << file.reads << " bytes=" << file.bytes_read
+                          << " size=" << file.size << " max_pos=" << file.max_position << " "
+                          << (file.bytes_read >= file.size ? "complete" : "PARTIAL") << "  " << file.path << "\n";
+            }
+        }
 
         // Threads the engine created run under the scheduler, so there is nothing left to replay
         // one at a time. Report what the guest left behind instead.
@@ -3217,9 +3595,41 @@ int main(int argc, char **argv) {
                       << " vertices, richest list " << g_host.ge_walk_max_draws << " draws / "
                       << g_host.ge_walk_max_vertices << " vertices, " << g_host.ge_walk_unfinished
                       << " unfinished, " << g_host.ge_walk_outside << " left RAM\n";
+            std::cout << "--- GE incremental: " << g_host.ge_incremental_walks << " walks, "
+                      << g_host.ge_incremental_draws << " draws, " << g_host.ge_incremental_vertices
+                      << " vertices, " << g_host.ge_list_start.size() << " lists issued\n";
             for (std::size_t i = 0u; i < shown; ++i) {
                 std::cout << "    0x" << std::hex << commands[i].first << std::dec << "  " << commands[i].second
                           << "\n";
+            }
+        }
+
+        // Temporary: what the guest calls once it is presenting frames. A steady state built on
+        // one or two imports is a poll loop; a broad spread is real work.
+        {
+            std::vector<std::pair<std::string, std::uint64_t>> calls(
+                g_host.steady_import_calls.begin(), g_host.steady_import_calls.end());
+            std::sort(calls.begin(), calls.end(),
+                [](const auto &left, const auto &right) { return left.second > right.second; });
+            const std::size_t shown = std::min<std::size_t>(calls.size(), 16u);
+            std::cout << "--- imports after frame 600 (" << g_host.steady_imports << " calls, " << calls.size()
+                      << " distinct, top " << shown << ")\n";
+            for (std::size_t i = 0u; i < shown; ++i) {
+                std::cout << "    " << calls[i].second << "  " << calls[i].first << "\n";
+            }
+        }
+
+        // Temporary: the whole run, so a subsystem that was used during boot and then never
+        // again is distinguishable from one that never ran at all.
+        {
+            std::vector<std::pair<std::string, std::uint64_t>> calls(
+                g_host.import_calls.begin(), g_host.import_calls.end());
+            std::sort(calls.begin(), calls.end(),
+                [](const auto &left, const auto &right) { return left.second > right.second; });
+            const std::size_t shown = std::min<std::size_t>(calls.size(), 40u);
+            std::cout << "--- imports whole run (" << calls.size() << " distinct, top " << shown << ")\n";
+            for (std::size_t i = 0u; i < shown; ++i) {
+                std::cout << "    " << calls[i].second << "  " << calls[i].first << "\n";
             }
         }
 
