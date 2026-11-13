@@ -302,6 +302,17 @@ struct Host {
     // from the display lists instead of assumed from the frame count.
     std::unordered_map<std::uint32_t, std::uint64_t> ge_command_hist;
     std::uint64_t ge_list_words{};
+    // Temporary: what the display lists ask the GE to draw, accumulated over the run. A frame
+    // that queues a list but draws nothing is a different problem from a frame that draws a
+    // whole scene, and this is the number that tells them apart.
+    std::uint64_t ge_walk_lists{};
+    std::uint64_t ge_walk_commands{};
+    std::uint64_t ge_walk_draws{};
+    std::uint64_t ge_walk_vertices{};
+    std::uint64_t ge_walk_outside{};
+    std::uint64_t ge_walk_unfinished{};
+    std::uint64_t ge_walk_max_draws{};
+    std::uint64_t ge_walk_max_vertices{};
 
     bool widget_seen[std::size(kWidgetProbes)]{};
     std::size_t widget_hits{};
@@ -1353,6 +1364,109 @@ void module_return_sentinel(Runtime &runtime, AllegrexContext &ctx) {
 // Every bound import is a scheduling point. The generated import stub already tolerates an HLE
 // call that hands back another thread's registers, so this wrapper is the single place where the
 // guest CPU may change under a running thread.
+// A GE display list is a chain of 32-bit words: the top byte names the command, bits 16..23
+// count the parameter words that follow, and the low bits carry the first parameter. CALL
+// pushes a return address, RET pops it, JUMP moves the cursor, and END or FINISH stops.
+// Walking it the way the hardware does is the cheapest honest answer to "is the game drawing
+// anything". A CALL whose target leaves guest RAM is counted and named instead of being
+// treated as the end of the list, because that is exactly what a wrong address convention
+// looks like from here.
+struct GeListWalk {
+    std::size_t commands{};
+    std::size_t draws{};
+    std::size_t vertices{};
+    std::size_t signals{};
+    std::size_t calls{};
+    std::size_t outside{};
+    std::size_t depth_exceeded{};
+    bool finished{};
+    std::uint32_t first_call_target{};
+    std::uint32_t first_call_resolved{};
+    bool first_call_used_base{};
+    std::uint32_t first_outside_pc{};
+};
+
+GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t start) {
+    GeListWalk walk;
+    std::uint32_t pc = start;
+    // The GE encodes one word per command: the top byte names it and the low 24 bits carry
+    // its data. BASE turns data bits 16..19 into address bits 24..27, and ORIGIN makes later
+    // relative addresses count from itself, so a CALL can name a sublist compactly.
+    std::uint32_t base_extended = 0u;
+    std::uint32_t offset_address = 0u;
+    const auto relative = [&](std::uint32_t data) {
+        return (offset_address + (base_extended | (data & 0x00FFFFFFu))) & 0x0FFFFFFFu;
+    };
+    std::vector<std::uint32_t> returns;
+    for (std::size_t step = 0u; step < 400000u; ++step) {
+        if (!memory.contains(pc, 4u)) {
+            ++walk.outside;
+            if (walk.first_outside_pc == 0u) walk.first_outside_pc = pc;
+            return walk;
+        }
+        const std::uint32_t word = memory.aot_load32(pc);
+        const std::uint32_t command = word >> 24u;
+        const std::uint32_t data = word & 0x00FFFFFFu;
+        ++walk.commands;
+        const std::uint32_t here = pc;
+        pc += 4u;
+        if (command == 0x10u) {  // BASE
+            base_extended = (data & 0x000F0000u) << 8u;
+            continue;
+        }
+        if (command == 0x14u) {  // ORIGIN
+            offset_address = here;
+            continue;
+        }
+        if (command == 0x04u) {  // PRIM: the low 16 bits are the vertex count
+            ++walk.draws;
+            walk.vertices += data & 0xFFFFu;
+            continue;
+        }
+        if (command == 0x0Eu) {  // SIGNAL
+            ++walk.signals;
+            continue;
+        }
+        if (command == 0x0Au) {  // CALL
+            ++walk.calls;
+            const std::uint32_t target = relative(data) & 0x0FFFFFFCu;
+            if (walk.first_call_target == 0u) {
+                walk.first_call_target = word;
+                walk.first_call_resolved = target;
+            }
+            if (!memory.contains(target, 4u)) {
+                ++walk.outside;
+                if (walk.first_outside_pc == 0u) walk.first_outside_pc = target;
+                return walk;
+            }
+            if (returns.size() >= 8u) {
+                ++walk.depth_exceeded;
+                return walk;
+            }
+            returns.push_back(pc);
+            pc = target;
+            continue;
+        }
+        if (command == 0x08u) {  // JUMP
+            pc = relative(data) & 0x0FFFFFFCu;
+            continue;
+        }
+        if (command == 0x0Bu) {  // RET
+            if (returns.empty()) {
+                return walk;
+            }
+            pc = returns.back();
+            returns.pop_back();
+            continue;
+        }
+        if (command == 0x0Cu || command == 0x0Fu) {  // END / FINISH
+            walk.finished = true;
+            return walk;
+        }
+    }
+    return walk;
+}
+
 void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     auto bind = [&runtime, &bound](const char *library, std::uint32_t nid, const char *name,
                     std::function<void(Runtime &, AllegrexContext &)> fn) {
@@ -2378,31 +2492,101 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             const std::uint32_t id = g_host.next_ge_list_id++;
             g_host.ge_stall[id] = list;  // the list is consumed immediately: stall == start
             ++g_host.ge_lists_queued;
+            // Walk the list as the GE would, every time it is queued. This is the number that
+            // says whether a frame draws anything, and it costs one pass over the words.
+            if (runtime.memory().contains(list, 4u) && runtime.memory().aot_load32(list) != 0u) {
+                const GeListWalk walk = walk_ge_list(runtime.memory(), list);
+                ++g_host.ge_walk_lists;
+                g_host.ge_walk_commands += walk.commands;
+                g_host.ge_walk_draws += walk.draws;
+                g_host.ge_walk_vertices += walk.vertices;
+                g_host.ge_walk_outside += walk.outside;
+                if (!walk.finished) ++g_host.ge_walk_unfinished;
+                if (walk.draws > g_host.ge_walk_max_draws) g_host.ge_walk_max_draws = walk.draws;
+                if (walk.vertices > g_host.ge_walk_max_vertices) g_host.ge_walk_max_vertices = walk.vertices;
+            }
             // Temporary: what the guest actually asks the GE to draw. A real command stream
             // means the game is rendering; an empty one means it is not. Buffers are reused
-            // every frame, so each distinct address is scanned once.
-            static std::unordered_set<std::uint32_t> scanned_lists;
+            // every frame, so each distinct address is scanned a few times: a double-buffered
+            // list can still be zeroed when it is first queued and filled afterwards.
+            static std::unordered_map<std::uint32_t, unsigned> list_attempts;
+            static std::unordered_map<std::uint32_t, std::uint32_t> best_length;
+            static std::unordered_map<std::uint32_t, std::uint32_t> best_non_zero;
             static std::size_t dumped = 0u;
-            if (scanned_lists.size() < 256u && scanned_lists.insert(list).second) {
-                std::uint32_t length = 0u;
-                for (; length < 2048u; ++length) {
-                    const std::uint32_t address = list + length * 4u;
-                    if (!runtime.memory().contains(address, 4u)) break;
-                    const std::uint32_t word = runtime.memory().aot_load32(address);
-                    ++g_host.ge_command_hist[word >> 24u];
-                    ++g_host.ge_list_words;
-                    if ((word >> 24u) == 0x0Fu) {
-                        ++length;
-                        break;
+            if (list_attempts.size() < 256u || list_attempts.count(list) != 0u) {
+                unsigned &attempts = list_attempts[list];
+                if (attempts < 4u) {
+                    ++attempts;
+                    std::uint32_t length = 0u;
+                    std::uint32_t non_zero = 0u;
+                    for (; length < 4096u; ++length) {
+                        const std::uint32_t address = list + length * 4u;
+                        if (!runtime.memory().contains(address, 4u)) break;
+                        const std::uint32_t word = runtime.memory().aot_load32(address);
+                        if (word != 0u) ++non_zero;
+                        ++g_host.ge_command_hist[word >> 24u];
+                        ++g_host.ge_list_words;
+                        if ((word >> 24u) == 0x0Fu) {
+                            ++length;
+                            break;
+                        }
                     }
-                }
-                if (dumped < 3u && length > 4u) {
-                    ++dumped;
-                    std::cout << "[ge] list#" << id << " addr=" << hex32(list) << " stall=" << hex32(stall)
-                              << " words=" << length << " thread=" << g_host.current_thread_uid
-                              << " ra=" << hex32(ctx.gpr[31]) << "\n";
-                    for (std::uint32_t i = 0u; i < 24u && i < length; ++i) {
-                        std::cout << "     " << hex32(runtime.memory().aot_load32(list + i * 4u)) << "\n";
+                    if (non_zero > best_non_zero[list]) {
+                        best_non_zero[list] = non_zero;
+                        best_length[list] = length;
+                    }
+                    // Only a list that carries commands says anything about what is being drawn.
+                    // A zeroed buffer is a scratch area, so printing it as if it were a display
+                    // list is what made the first reading look like an empty renderer.
+                    if (dumped < 4u && non_zero >= 8u) {
+                        ++dumped;
+                        std::cout << "[ge] list#" << id << " addr=" << hex32(list) << " stall=" << hex32(stall)
+                                  << " words=" << length << " non_zero=" << non_zero
+                                  << " thread=" << g_host.current_thread_uid
+                                  << " ra=" << hex32(ctx.gpr[31]) << "\n";
+                        std::uint32_t first_non_zero = 0u;
+                        for (std::uint32_t i = 0u; i < 48u && i < length; ++i) {
+                            const std::uint32_t address = list + i * 4u;
+                            if (runtime.memory().aot_load32(address) != 0u) {
+                                first_non_zero = i;
+                                break;
+                            }
+                        }
+                        for (std::uint32_t i = first_non_zero; i < first_non_zero + 48u && i < length; ++i) {
+                            std::cout << "     [" << i << "] " << hex32(runtime.memory().aot_load32(list + i * 4u))
+                                      << "\n";
+                        }
+                        const GeListWalk walk = walk_ge_list(runtime.memory(), list);
+                        std::cout << "[ge]   walk: commands=" << walk.commands << " draws=" << walk.draws
+                                  << " vertices=" << walk.vertices << " signals=" << walk.signals
+                                  << " calls=" << walk.calls << " finished=" << (walk.finished ? 1 : 0)
+                                  << " outside=" << walk.outside;
+                        if (walk.depth_exceeded != 0u) std::cout << " depth_exceeded=" << walk.depth_exceeded;
+                        std::cout << "\n";
+                        if (walk.first_call_target != 0u) {
+                            std::cout << "[ge]   first call word=" << hex32(walk.first_call_target)
+                                      << " -> " << hex32(walk.first_call_resolved) << "\n";
+                            if (runtime.memory().contains(walk.first_call_resolved, 4u)) {
+                                for (std::uint32_t i = 0u; i < 12u; ++i) {
+                                    const std::uint32_t address = walk.first_call_resolved + i * 4u;
+                                    if (!runtime.memory().contains(address, 4u)) break;
+                                    std::cout << "       " << hex32(runtime.memory().aot_load32(address)) << "\n";
+                                }
+                            }
+                        }
+                        if (walk.first_outside_pc != 0u) {
+                            std::cout << "[ge]   left RAM at " << hex32(walk.first_outside_pc) << "\n";
+                        }
+                        std::cout << std::flush;
+                    }
+                    if (list_attempts.size() % 32u == 0u) {
+                        std::size_t with_content = 0u;
+                        for (const auto &entry : best_non_zero) {
+                            if (entry.second != 0u) ++with_content;
+                        }
+                        std::cout << "[ge] distinct lists=" << list_attempts.size() << " with content="
+                                  << with_content << " zeroed="
+                                  << (list_attempts.size() - with_content) << "\n" << std::flush;
                     }
                 }
             }
@@ -3028,6 +3212,11 @@ int main(int argc, char **argv) {
             const std::size_t shown = std::min<std::size_t>(commands.size(), 16u);
             std::cout << "--- GE commands (" << commands.size() << " distinct, " << g_host.ge_list_words
                       << " words scanned, top " << shown << ")\n";
+            std::cout << "--- GE walks: " << g_host.ge_walk_lists << " lists, " << g_host.ge_walk_commands
+                      << " commands, " << g_host.ge_walk_draws << " draws, " << g_host.ge_walk_vertices
+                      << " vertices, richest list " << g_host.ge_walk_max_draws << " draws / "
+                      << g_host.ge_walk_max_vertices << " vertices, " << g_host.ge_walk_unfinished
+                      << " unfinished, " << g_host.ge_walk_outside << " left RAM\n";
             for (std::size_t i = 0u; i < shown; ++i) {
                 std::cout << "    0x" << std::hex << commands[i].first << std::dec << "  " << commands[i].second
                           << "\n";

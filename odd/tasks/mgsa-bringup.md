@@ -99,3 +99,24 @@ this phase. The deliverable is the measurement, not playability.
     the lists enqueued from `ra=0x08923164` (`0x499E1000`, `0x489B8880`) are 2,048 zero words each.
     The uncached-alias theory is refuted: `GuestMemory::canonical` (`& 0x1FFFFFFF`) already maps
     both aliases to the same physical window.
+
+- **L4** — the "empty display lists" reading in L2/L3 was a measurement bug, and the game is drawing.
+  - The GE encodes one word per command: the top byte names it and the low 24 bits carry its data.
+    There is no parameter-count field. `BASE` turns data bits 16..19 into address bits 24..27, and
+    `ORIGIN` makes later relative addresses count from itself. That rule comes from Yakumo's
+    `profiles/mhp3rd/host/gpu/ge_state.cpp`, not from memory.
+  - The earlier scan reported 2,048 zero words because it read a double-buffered list the first
+    time it was queued, before the guest had filled it. Re-scanning the same address on later
+    enqueues shows content.
+  - `walk_ge_list` now follows the list the way the hardware does (CALL/RET/JUMP/END/FINISH, with
+    BASE and ORIGIN applied) and runs on every enqueue. Over the run: 1,031 lists, 127,940 commands,
+    **1,030 draws, 2,060 vertices, richest list 1 draw / 2 vertices, 0 unfinished, 0 left RAM**.
+  - So every queued list draws exactly one primitive of two vertices. The scissor pair in the
+    sublist at `0x09B21000` decodes to `(0,0)-(479,271)`: one full-screen sprite per list. That is
+    a fade or a loading screen, not a scene, and it is what a boot that has not reached gameplay
+    looks like from the GE's side.
+  - `0x0AB21000` is a `CALL` whose data is only the low 24 bits; it resolves through BASE/ORIGIN to
+    `0x09B21000`, which is inside RAM and holds a real sublist. Reading it as an absolute address
+    is what made it look like the list left guest memory.
+  - Not a defect, but worth naming: the same 124-command, one-sprite list repeats every two frames,
+    so the guest is spending its frame budget on state setup for a single quad.
