@@ -10,3 +10,6 @@
 profile/**/generated/
 *.recomp.c
 *.recomp.cpp
+
+# Local agent tooling state: machine-specific absolute paths
+/.atl/

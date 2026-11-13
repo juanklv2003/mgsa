@@ -1,0 +1,367 @@
+﻿diff --git a/include/psprecomp/allegrex_context.hpp b/include/psprecomp/allegrex_context.hpp
+index 00e8ccc..b92f15e 100644
+--- a/include/psprecomp/allegrex_context.hpp
++++ b/include/psprecomp/allegrex_context.hpp
+@@ -635,6 +635,45 @@ struct alignas(16) AllegrexContext {
+         write_vfpu_vector_with_destination_prefix(result, destination_register, destination_length);
+     }
+ 
++    void execute_vfpu_vi2x(std::uint32_t destination_register, std::uint32_t source_register,
++        std::uint32_t source_length, std::uint32_t operation) noexcept {
++        if (source_length == 0u || source_length > 4u || operation > 3u) return;
++
++        float source[4]{};
++        read_vfpu_vector(source, source_register, source_length);
++        apply_vfpu_source_prefix(source, source_length, 0u);
++
++        // Bytes for VI2UC/VI2C, half-words for VI2US/VI2S. Each source lane is an
++        // integer; the conversion saturates it into the narrower field instead of
++        // wrapping, and the fields fill the destination from its first byte.
++        const bool narrow_to_byte = operation < 2u;
++        std::uint32_t result_bits[4]{};
++        for (std::uint32_t lane = 0u; lane < source_length; ++lane) {
++            const auto value = static_cast<std::int32_t>(std::bit_cast<std::uint32_t>(source[lane]));
++            std::int32_t clamped = value;
++            if (operation == 0u) {
++                clamped = value < 0 ? 0 : (value > 0xFF ? 0xFF : value);
++            } else if (operation == 1u) {
++                clamped = value < -0x80 ? -0x80 : (value > 0x7F ? 0x7F : value);
++            } else if (operation == 2u) {
++                clamped = value < 0 ? 0 : (value > 0xFFFF ? 0xFFFF : value);
++            } else {
++                clamped = value < -0x8000 ? -0x8000 : (value > 0x7FFF ? 0x7FFF : value);
++            }
++            const auto field = static_cast<std::uint32_t>(clamped);
++            if (narrow_to_byte)
++                result_bits[lane / 4u] |= field << ((lane % 4u) * 8u);
++            else
++                result_bits[lane / 2u] |= field << ((lane % 2u) * 16u);
++        }
++
++        const std::uint32_t destination_length = narrow_to_byte ? 1u : (source_length > 1u ? 2u : 1u);
++        float result[4]{};
++        for (std::uint32_t lane = 0u; lane < destination_length; ++lane)
++            result[lane] = std::bit_cast<float>(result_bits[lane]);
++        write_vfpu_vector_with_destination_prefix(result, destination_register, destination_length);
++    }
++
+     template <std::uint32_t DestinationScalarRegister, std::uint32_t SourceRegister, std::uint32_t TargetRegister,
+         std::uint32_t Length>
+     PSPRECOMP_CONTEXT_FORCEINLINE void execute_vfpu_vdot_ct() noexcept {
+@@ -773,6 +812,25 @@ struct alignas(16) AllegrexContext {
+         return std::bit_cast<std::uint32_t>(selected);
+     }
+ 
++    // VCRS.T is the partial cross product: the PSP splits a cross product into
++    // three independent products so a routine can accumulate them with the
++    // destination-write mask. It reads its two source vectors unprefixed and
++    // writes only through the D prefix.
++    void execute_vfpu_vcrs(std::uint32_t destination_register, std::uint32_t source_register,
++        std::uint32_t target_register, std::uint32_t length) noexcept {
++        if (length == 0u || length > 4u) return;
++
++        float source[4]{};
++        float target[4]{};
++        float result[4]{};
++        read_vfpu_vector(source, source_register, length);
++        read_vfpu_vector(target, target_register, length);
++        result[0] = source[1] * target[2];
++        result[1] = source[2] * target[0];
++        result[2] = source[0] * target[1];
++        write_vfpu_vector_with_destination_prefix(result, destination_register, length);
++    }
++
+     void execute_vfpu_cross_quat(std::uint32_t destination_register, std::uint32_t source_register,
+         std::uint32_t target_register, std::uint32_t length) noexcept {
+         if (length == 0u || length > 4u) return;
+diff --git a/include/psprecomp/decoder.hpp b/include/psprecomp/decoder.hpp
+index 3258cad..f1996f9 100644
+--- a/include/psprecomp/decoder.hpp
++++ b/include/psprecomp/decoder.hpp
+@@ -130,6 +130,7 @@ enum class OpcodeKind {
+     Vf2i,
+     Vi2f,
+     Vx2i,
++    Vi2x,
+     VmidT,
+     Vmmov,
+     VfpuMatrixInit,
+@@ -144,6 +145,7 @@ enum class OpcodeKind {
+     Vscl,
+     Vdot,
+     Vhdp,
++    Vcrs,
+     Vcmp,
+     Vminmax,
+     VfpuCompare3,
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 277e662..b8c3a56 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -645,6 +645,12 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
+         } else if (operation == 4u) {
+             d.kind = OpcodeKind::Vhdp;
+             d.mnemonic = "vhdp";
++        } else if (operation == 5u) {
++            // VFPU1 sub-operation 5 is the partial cross product. It only has a
++            // .t flavour, and the three products it produces are combined by the
++            // destination-write mask of the following instruction.
++            d.kind = OpcodeKind::Vcrs;
++            d.mnemonic = "vcrs";
+         } else {
+             d.kind = OpcodeKind::Vfpu;
+             d.mnemonic = "vfpu1";
+@@ -713,6 +719,12 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
+             d.kind = OpcodeKind::Vx2i;
+             static constexpr const char *names[4]{"vuc2i", "vc2i", "vus2i", "vs2i"};
+             d.mnemonic = names[operation - 24u];
++        } else if (group == 1u && operation >= 28u && operation <= 31u) {
++            // The narrowing half of the same family: an integer lane is
++            // saturated into a byte or a half-word of the destination.
++            d.kind = OpcodeKind::Vi2x;
++            static constexpr const char *names[4]{"vi2uc", "vi2c", "vi2us", "vi2s"};
++            d.mnemonic = names[operation - 28u];
+         } else if (group >= 16u && group <= 19u) {
+             d.kind = OpcodeKind::Vf2i;
+             static constexpr const char *names[4]{"vf2in", "vf2iz", "vf2iu", "vf2id"};
+diff --git a/src/interpreter.cpp b/src/interpreter.cpp
+index d4e6b61..516e2fd 100644
+--- a/src/interpreter.cpp
++++ b/src/interpreter.cpp
+@@ -54,6 +54,19 @@ void note_entry(std::uint32_t pc) {
+     ++g_announced;
+ }
+ 
++// An instruction the interpreter decodes but does not simulate still has to
++// retire. Leaving the pc on it makes the dispatcher re-enter the same address
++// forever, which looks like a hang and hides everything that comes after it.
++// Each distinct encoding is reported once so the missing set stays visible.
++constexpr std::size_t kMaxRetiredForms = 128u;
++std::unordered_map<std::uint32_t, std::uint32_t> g_retired_instructions;
++
++void note_retired_instruction(std::uint32_t pc, std::uint32_t word, const std::string &mnemonic) {
++    if (g_retired_instructions.size() >= kMaxRetiredForms) return;
++    if (!g_retired_instructions.emplace(word, pc).second) return;
++    std::cerr << "[interpreter] not simulated: " << mnemonic << " " << hex32(word) << " at " << hex32(pc) << "\n";
++}
++
+ void charge_entry(std::uint32_t pc, std::uint64_t instructions) {
+     const auto found = g_entry_profile.find(pc);
+     if (found != g_entry_profile.end()) found->second += instructions;
+@@ -623,6 +636,9 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+     case OpcodeKind::Vx2i:
+         ctx.execute_vfpu_vx2i(vfpu_vd(d.word), vfpu_vs(d.word), vfpu_length(d.word), (d.word >> 16u) & 3u);
+         break;
++    case OpcodeKind::Vi2x:
++        ctx.execute_vfpu_vi2x(vfpu_vd(d.word), vfpu_vs(d.word), vfpu_length(d.word), (d.word >> 16u) & 3u);
++        break;
+     case OpcodeKind::Vf2i: {
+         const std::uint32_t length = vfpu_length(d.word);
+         const std::uint32_t destination = vfpu_vd(d.word);
+@@ -843,6 +859,9 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+     case OpcodeKind::Vhdp:
+         ctx.execute_vfpu_vhdp(vfpu_vd(d.word), vfpu_vs(d.word), vfpu_vt(d.word), vfpu_length(d.word));
+         break;
++    case OpcodeKind::Vcrs:
++        ctx.execute_vfpu_vcrs(vfpu_vd(d.word), vfpu_vs(d.word), vfpu_vt(d.word), vfpu_length(d.word));
++        break;
+     case OpcodeKind::VcrossQuat:
+         ctx.execute_vfpu_cross_quat(vfpu_vd(d.word), vfpu_vs(d.word), vfpu_vt(d.word), vfpu_length(d.word));
+         break;
+@@ -939,6 +958,13 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction
+         break;
+     }
+ 
++    case OpcodeKind::Vfpu:
++        // Decoded as a VFPU form this build has no semantics for. Retiring it
++        // keeps the title executing and reports the encoding once; stopping
++        // here would only re-enter the same address forever.
++        note_retired_instruction(pc, d.word, d.mnemonic);
++        break;
++
+     default:
+         ctx.pc = pc;
+         rt.unsupported(pc, d.word, d.mnemonic + " not interpreted");
+@@ -981,6 +1007,7 @@ void reset_interpreter_stats() noexcept {
+     g_instructions = 0u;
+     g_entries = 0u;
+     g_announced = 0u;
++    g_retired_instructions.clear();
+     g_entry_profile.clear();
+ }
+ 
+diff --git a/tests/test_main.cpp b/tests/test_main.cpp
+index 989c3d7..c032a1a 100644
+--- a/tests/test_main.cpp
++++ b/tests/test_main.cpp
+@@ -270,6 +270,25 @@ static void test_interpreter_unaligned_word_access() {
+     require(runtime.memory().load32(kInterpreterScratch + 0x20u) == 0x77663344u, "SWR wrote the wrong bytes");
+ }
+ 
++static void test_interpreter_retires_unmodelled_instruction() {
++    psprecomp::Runtime runtime;
++    runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
++    load_program(runtime, kInterpreterBase,
++        {
++            0xD0240000u,                    // a VFPU4 form with no semantics here
++            mips_i(0x09u, 0u, 8u, 0x2Au),   // addiu t0, zero, 42
++            mips_r(31u, 0u, 0u, 0u, 0x08u), // jr  ra
++            0u,                             // nop
++        });
++
++    psprecomp::AllegrexContext ctx{};
++    ctx.pc = kInterpreterBase;
++    ctx.gpr[31] = kInterpreterExit;
++    require(psprecomp::interpret_allegrex(runtime, ctx) == psprecomp::InterpreterExit::Dispatch,
++        "Unmodelled-instruction fixture did not reach the registered exit");
++    require(ctx.gpr[8] == 42u, "An unmodelled VFPU instruction did not retire and lost the instructions after it");
++}
++
+ static void test_interpreter_hi_lo() {
+     psprecomp::Runtime runtime;
+     runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
+@@ -558,6 +577,7 @@ static std::vector<std::uint8_t> make_vh2f_test_elf() {
+         0xD2830182u, // vi2f.p C002, C001, 3
+         0xD2202020u, // vf2iz.s S032, S032, 0
+         0xD03B0280u, // vs2i.p C000, C002
++        0xD03F88C0u, // vi2s.q C040, C010
+         0xD047A408u, // vavg.t S008, C440
+         0xD03200C0u, // vf2h.p S064, C000
+         0x03E00008u, // jr ra
+@@ -798,7 +818,7 @@ static void test_codegen_vh2f_lowering() {
+     }
+     {
+         std::ofstream out(csv_path);
+-        out << "name,address,size\nvh2f_test,0x08804000,0x00000020\n";
++        out << "name,address,size\nvh2f_test,0x08804000,0x00000024\n";
+     }
+ 
+     const std::filesystem::path codegen_path = codegen_tool_path();
+@@ -828,6 +848,9 @@ static void test_codegen_vh2f_lowering() {
+     require(text.find("vf2iz not lowered yet") == std::string::npos, "VF2IZ codegen retained an unsupported fallback");
+     require(text.find("ctx.execute_vfpu_vx2i(0u, 2u, 2u, 3u)") != std::string::npos,
+         "VS2I.P was not lowered to the dedicated AOT helper");
++    require(text.find("ctx.execute_vfpu_vi2x(64u, 8u, 4u, 3u)") != std::string::npos,
++        "VI2S.Q was not lowered to the dedicated AOT helper");
++    require(text.find("vi2s not lowered yet") == std::string::npos, "VI2S codegen retained an unsupported fallback");
+     require(text.find("ctx.execute_vfpu_horizontal(8u, 36u, 3u, true)") != std::string::npos,
+         "VAVG.T was not lowered to the dedicated AOT helper");
+     require(text.find("ctx.execute_vfpu_vf2h(64u, 0u, 2u)") != std::string::npos,
+@@ -1132,7 +1155,8 @@ int main() {
+         test_nested_direct_chain_context_guard();
+         test_interpreter_delay_slots_and_branch_likely();
+         test_interpreter_unaligned_word_access();
+-        test_interpreter_hi_lo();
++        test_interpreter_retires_unmodelled_instruction();
++    test_interpreter_hi_lo();
+         test_interpreter_floating_point();
+         test_interpreter_dispatch_fallback();
+         test_interpreter_budget_and_disable();
+@@ -1308,6 +1332,11 @@ int main() {
+         require(vdot.kind == psprecomp::OpcodeKind::Vdot && vdot.mnemonic == "vdot", "VDOT.T classification failed");
+         const auto vhdp = psprecomp::decode_allegrex(0x663481A2u);
+         require(vhdp.kind == psprecomp::OpcodeKind::Vhdp && vhdp.mnemonic == "vhdp", "VHDP.Q classification failed");
++        // The two words that Metal Gear AC!D's math helper uses, taken from the
++        // shipped executable rather than hand-assembled.
++        const auto vcrs = psprecomp::decode_allegrex(0x66858406u);
++        require(vcrs.kind == psprecomp::OpcodeKind::Vcrs && vcrs.mnemonic == "vcrs",
++            "VCRS.T classification failed");
+         const auto vcmp = psprecomp::decode_allegrex(0x6C201C03u);
+         require(vcmp.kind == psprecomp::OpcodeKind::Vcmp && vcmp.mnemonic == "vcmp", "VCMP.S LE classification failed");
+         const auto vmin = psprecomp::decode_allegrex(0x6D018002u);
+@@ -1766,6 +1795,57 @@ int main() {
+             vx2i_context.vfpu_ctrl[0] == 0xE4u && vx2i_context.vfpu_ctrl[1] == 0xE4u && vx2i_context.vfpu_ctrl[2] == 0u,
+             "VX2I did not consume VFPU prefixes");
+ 
++        psprecomp::AllegrexContext vi2x_context{};
++        vi2x_context.eat_vfpu_prefixes();
++        const float vi2s_source[4]{
++            std::bit_cast<float>(static_cast<std::uint32_t>(-40000)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(70000)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(-1)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(256)),
++        };
++        vi2x_context.write_vfpu_vector(vi2s_source, 8u, 4u);
++        vi2x_context.execute_vfpu_vi2x(64u, 8u, 4u, 3u);
++        float vi2x_result[4]{};
++        vi2x_context.read_vfpu_vector(vi2x_result, 64u, 4u);
++        require(std::bit_cast<std::uint32_t>(vi2x_result[0]) == 0x7FFF8000u &&
++                std::bit_cast<std::uint32_t>(vi2x_result[1]) == 0x0100FFFFu,
++            "VI2S saturating half-word narrowing failed");
++
++        vi2x_context.eat_vfpu_prefixes();
++        const float vi2uc_source[4]{
++            std::bit_cast<float>(static_cast<std::uint32_t>(-5)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(300)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(7)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(128)),
++        };
++        vi2x_context.write_vfpu_vector(vi2uc_source, 8u, 4u);
++        vi2x_context.execute_vfpu_vi2x(64u, 8u, 4u, 0u);
++        vi2x_context.read_vfpu_vector(vi2x_result, 64u, 4u);
++        require(std::bit_cast<std::uint32_t>(vi2x_result[0]) == 0x8007FF00u,
++            "VI2UC unsigned byte saturation failed");
++
++        vi2x_context.eat_vfpu_prefixes();
++        const float vi2c_source[4]{
++            std::bit_cast<float>(static_cast<std::uint32_t>(-200)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(200)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(-1)),
++            std::bit_cast<float>(static_cast<std::uint32_t>(5)),
++        };
++        vi2x_context.write_vfpu_vector(vi2c_source, 8u, 4u);
++        vi2x_context.execute_vfpu_vi2x(64u, 8u, 4u, 1u);
++        vi2x_context.read_vfpu_vector(vi2x_result, 64u, 4u);
++        require(std::bit_cast<std::uint32_t>(vi2x_result[0]) == 0x05FF7F80u,
++            "VI2C signed byte saturation failed");
++        require(vi2x_context.vfpu_ctrl[0] == 0xE4u && vi2x_context.vfpu_ctrl[1] == 0xE4u,
++            "VI2X did not consume VFPU prefixes");
++
++        require(psprecomp::decode_allegrex(0xD03F88CCu).kind == psprecomp::OpcodeKind::Vi2x &&
++                psprecomp::decode_allegrex(0xD03F88CCu).mnemonic == "vi2s",
++            "VI2S.Q decode failed");
++        require(psprecomp::decode_allegrex(0xD03C89ACu).kind == psprecomp::OpcodeKind::Vi2x &&
++                psprecomp::decode_allegrex(0xD03C89ACu).mnemonic == "vi2uc",
++            "VI2UC.Q decode failed");
++
+         require(psprecomp::decode_allegrex(0xD047A408u).kind == psprecomp::OpcodeKind::VfpuHorizontal &&
+                 psprecomp::decode_allegrex(0xD047A408u).mnemonic == "vavg",
+             "VAVG.T decode failed");
+diff --git a/tools/codegen_main.cpp b/tools/codegen_main.cpp
+index 0381ba2..2bd734d 100644
+--- a/tools/codegen_main.cpp
++++ b/tools/codegen_main.cpp
+@@ -612,6 +612,16 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+             << operation << "u);\n";
+         break;
+     }
++    case psprecomp::OpcodeKind::Vi2x: {
++        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
++        const std::uint32_t source_length = size_code + 1u;
++        const std::uint32_t destination = d.word & 0x7Fu;
++        const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
++        const std::uint32_t operation = (d.word >> 16u) & 3u;
++        out << "    ctx.execute_vfpu_vi2x(" << destination << "u, " << source << "u, " << source_length << "u, "
++            << operation << "u);\n";
++        break;
++    }
+     case psprecomp::OpcodeKind::Mtv:
+         out << "    ctx.set_vfpu_scalar_bits(" << (d.word & 0xFFu) << "u, " << reg(d.rt) << ");\n";
+         break;
+@@ -832,6 +842,16 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+             << "u);\n";
+         break;
+     }
++    case psprecomp::OpcodeKind::Vcrs: {
++        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
++        const std::uint32_t length = size_code + 1u;
++        const std::uint32_t destination = d.word & 0x7Fu;
++        const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
++        const std::uint32_t target = (d.word >> 16u) & 0x7Fu;
++        out << "    ctx.execute_vfpu_vcrs(" << destination << "u, " << source << "u, " << target << "u, " << length
++            << "u);\n";
++        break;
++    }
+     case psprecomp::OpcodeKind::VcrossQuat: {
+         const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
+         const std::uint32_t length = size_code + 1u;
