@@ -1111,6 +1111,12 @@ std::size_t load_prx_module_impl(Runtime &runtime, psprecomp::Elf32Image image, 
               << " relocations=" << relocations.total << " imports=" << imports.size() << " exports=" << export_count
               << "\n"
               << std::flush;
+        if (module.name == "mgp_stage") {
+            std::cout << "[module]   relocated 0x0038: " << hex32(runtime.memory().aot_load32(module.base + 0x38u)) << "\n" << std::flush;
+            std::cout << "[module]   relocated 0x003C: " << hex32(runtime.memory().aot_load32(module.base + 0x3Cu)) << "\n" << std::flush;
+            std::cout << "[module]   relocated 0x0044: " << hex32(runtime.memory().aot_load32(module.base + 0x44u)) << "\n" << std::flush;
+            std::cout << "[module]   relocated 0x004C: " << hex32(runtime.memory().aot_load32(module.base + 0x4Cu)) << "\n" << std::flush;
+        }
     // Temporary: an export is the only way to name what a module does when the guest calls it by
     // NID. Printing the table turns a `jal` into module code into a named function.
     if (module.name == "KCEJ_FS") {
@@ -1256,6 +1262,25 @@ Runtime::HleFunction make_prx_export_forwarder(std::string library, std::uint32_
         }
         enter_guest_code(runtime, ctx, g_host.modules[index], address->second, FrameKind::Export, 0u);
         frame_stack().back().nid = nid;
+        // Temporary: log every call to kjfs's file-open export (0x93E9297F) with the path/name
+        // argument, so the title-archive open at frame 36 is identifiable.
+        if (library == "kjfs") {
+            std::cout << "[kjfs] frame=" << g_host.vblank_count << " nid=" << hex32(nid)
+                      << " a0=" << hex32(ctx.gpr[4]) << " a1=" << hex32(ctx.gpr[5])
+                      << " a2=" << hex32(ctx.gpr[6]) << " a3=" << hex32(ctx.gpr[7])
+                      << " ra=" << hex32(ctx.gpr[31]) << " thread=" << g_host.current_thread_uid;
+            // Print the frame stack's return ra (the actual caller, not the sentinel).
+            if (!frame_stack().empty()) {
+                std::cout << " frame_ra=" << hex32(frame_stack().back().return_ra);
+            }
+            // Temporary: read mgp_stage's function pointers when cfg is called.
+            std::cout << "\n" << std::flush;
+        }
+        // Temporary: log mgp_stage's relocated instructions after load.
+        if (library == "mgp_stage_placeholder") { (void)0; }
+        // Temporary: read mgp_stage's relocated instructions after it's loaded.
+        // (logged separately below)
+        (void)0;
         // Temporary: which guest code calls into each module export, and when. The title archive
         // is opened at frame 36 by kjfs, and the caller's ra is the only way back to the game
         // function that owns that load.
@@ -2279,9 +2304,31 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         std::cout << "[module] start uid=" << uid << " '" << module.name << "' entry=" << hex32(module.entry)
                   << " argc=" << argsize << " argv=" << hex32(argp) << "\n"
                   << std::flush;
+        // Temporary: dump argv contents for mgp_stage to find function pointers.
+        if (module.name == "mgp_stage" && argp != 0u) {
+            for (std::uint32_t i = 0u; i < argsize && i < 8u; ++i) {
+                const std::uint32_t ptr = runtime.memory().contains(argp + i * 4u, 4u)
+                    ? runtime.memory().aot_load32(argp + i * 4u) : 0u;
+                std::cout << "[module]   argv[" << i << "] = " << hex32(ptr) << "\n" << std::flush;
+            }
+            // After module_start runs, read the function pointers it wrote.
+            // module_start writes to *argv[0] and *argv[1].
+            const std::uint32_t fp0_addr = runtime.memory().contains(argp, 4u) ? runtime.memory().aot_load32(argp) : 0u;
+            const std::uint32_t fp1_addr = runtime.memory().contains(argp + 4u, 4u) ? runtime.memory().aot_load32(argp + 4u) : 0u;
+            // These will be set after module_start returns. Log them after.
+        }
         ctx.gpr[4] = argsize;
         ctx.gpr[5] = argp;
         enter_guest_code(runtime, ctx, module, module.entry, FrameKind::ModuleStart, status_out);
+        // Log function pointers set by mgp_stage's module_start.
+        if (module.name == "mgp_stage" && argp != 0u) {
+            const std::uint32_t fp0_addr = runtime.memory().contains(argp, 4u) ? runtime.memory().aot_load32(argp) : 0u;
+            const std::uint32_t fp1_addr = runtime.memory().contains(argp + 4u, 4u) ? runtime.memory().aot_load32(argp + 4u) : 0u;
+            const std::uint32_t fp0 = (fp0_addr != 0u && runtime.memory().contains(fp0_addr, 4u)) ? runtime.memory().aot_load32(fp0_addr) : 0u;
+            const std::uint32_t fp1 = (fp1_addr != 0u && runtime.memory().contains(fp1_addr, 4u)) ? runtime.memory().aot_load32(fp1_addr) : 0u;
+            std::cout << "[module]   mgp_stage fp0 (argv[0]=" << hex32(fp0_addr) << ") = " << hex32(fp0) << "\n" << std::flush;
+            std::cout << "[module]   mgp_stage fp1 (argv[1]=" << hex32(fp1_addr) << ") = " << hex32(fp1) << "\n" << std::flush;
+        }
     });
     bind("ModuleMgrForUser", 0xD1FF982Au, "sceKernelStopModule", [](Runtime &, AllegrexContext &ctx) {
         const std::size_t index = find_loaded_module_by_uid(ctx.gpr[4]);

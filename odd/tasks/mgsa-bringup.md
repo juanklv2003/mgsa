@@ -120,3 +120,39 @@ this phase. The deliverable is the measurement, not playability.
     is what made it look like the list left guest memory.
   - Not a defect, but worth naming: the same 124-command, one-sprite list repeats every two frames,
     so the guest is spending its frame budget on state setup for a single quad.
+
+- **L5** — root cause of the black screen identified; the game is stuck before loading the title.
+  - **Input hypothesis REFUTED.** `--press` (START 0x0008, CROSS 0x4000) reaches the guest at
+    `0x08B50090`; the guest reads it and ignores it. Not a "press button" screen.
+  - **VRAM is 100% zero** (2 MiB, 0 non-zero words). The guest never writes pixels by CPU either.
+    The only draw per frame is a full-screen transparent (alpha=0) quad from (0,0) to (480,272).
+    Color 0x00000000 in ABGR8888.
+  - **stage/init/_zar fully consumed** (13 reads, 3,338,158 bytes). The earlier "78% read" was the
+    trace cap (10 reads/fd). Per-fd read totals are now logged.
+  - **stage/title/_zar (916,419 bytes) is opened at frame 36 by preseek via LBA and NEVER read or
+    closed.** This is the exact stall point. `arc` and `preseek` exit cleanly at frames 16 and 36.
+  - **Memory stick devctl** (mscmhc0: `0x02025806`) polled ~1/frame. `mgp_stage` treats `out[0]==1`
+    as "media present", retries 31 times, then state 2. Answering 0 (honest) or 1 (manufactured)
+    doesn't change the outcome. Changed to honest (0).
+  - **kjfs exports identified** via Ghidra decompilation:
+    - `0xC78E5271` (0x34C) = KFS_Init
+    - `0x93E9297F` (0xBF4) = Open file by LBA
+    - `0x1ECF095D` (0xC54) = Seek (sceIoLseek)
+    - `0x1B969771` (0xDB4) = Read (sceIoRead)
+    - `0x432F631B` (0xE78) = Read (with retry)
+    - `0x2B9B31B4` (0xFC4) = Close (sceIoClose)
+    - `0x813E06AD` (0x1094) = Config (copies 0x80 bytes to 0xa90, the lookup table)
+    - `0xCD04902E` (0x1110) = Dopen (opens directory)
+  - **Frame 36 flow:** `kjfs::0x813E06AD` called by Main with a struct containing
+    "stage/title/data.cnf" (configures the title LBA in 0xa90). Preseek opens the title archive
+    by LBA and seeks it (prefetch). Then preseek exits. **After frame 36: zero kjfs calls.**
+  - **mgp_stage function pointers:** `argv[0]` and `argv[1]` both point to `0x09FDF000` (module base),
+    which contains trivial code (`v0 = base; *a0 = base; return`). Not a title loader.
+  - **Scheduler bug (not fixed):** delayed threads (SceWaveMain, SDLOOP, KCEJW-SD, sdfile.c) never
+    wake because `schedule()` only runs on block and Main never blocks. Fixing by waking from vblank
+    desyncs the guest clock (21x faster). Reverted.
+  - **Ghidra 12.2 installed** with JDK 25. kjfs.prx and mgp_stage.prx analyzed.
+  - **The blocking condition is in BOOT.BIN's main loop** (~frame_ra 0x088047B8). Needs ~2000 instr RE.
+  - **Next step:** decompile BOOT.BIN main loop with Ghidra to find the condition that gates title
+    loading. Alternatively, experiment by setting memory flags/event flags.
+  - Engram: saved as topic `mgsa-bringup/black-screen-root-cause`.
