@@ -2989,6 +2989,11 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         bind("sceGe_user", nid, "sceGeListEnQueue", [](Runtime &runtime, AllegrexContext &ctx) {
             const std::uint32_t list = ctx.gpr[4];
             const std::uint32_t stall = ctx.gpr[5];
+            static int shown = 0;
+            if (shown < 3) {
+                ++shown;
+                std::cout << "[enq] list=" << hex32(list) << " stall=" << hex32(stall) << " ra=" << hex32(ctx.gpr[31]) << " thread=" << (current_thread() ? current_thread()->uid : 0u) << "\n" << std::flush;
+            }
             const std::uint32_t id = g_host.next_ge_list_id++;
             g_host.ge_stall[id] = list;  // the list is consumed immediately: stall == start
             g_host.ge_list_start[id] = list;
