@@ -2543,6 +2543,15 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             }
             g_host.files.push_back(std::move(file));
             ctx.gpr[2] = g_host.files.back().uid;
+            // Wake any kjfs read-ahead waiter: setting bit 2 (0x4) on uid=20 lets a blocked
+            // kjfs read proceed to sceIoRead.
+            for (auto &flag : g_host.event_flags) {
+                if (flag.uid == 20u) {
+                    flag.bits |= 0x4u;
+                    wake_waiting_threads(runtime, flag);
+                    break;
+                }
+            }
             return;
         }
 
