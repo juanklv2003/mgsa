@@ -751,8 +751,15 @@ void after_import(Runtime &runtime, AllegrexContext &ctx) {
     }
     GuestThread *current = current_thread();
     if (current == nullptr) return;
-    g_host.virtual_us += 1u;
-    ++g_host.imports_since_switch;
+    // Track guest PC/ra for Main thread to identify the main loop.
+    if (current != nullptr && current->uid == 3u) {
+        static std::uint32_t last_ra = 0u;
+        std::uint32_t ra = current->context.gpr[31];
+        if (ra != last_ra && ra != 0x0887BF1Cu && ra != 0x0887BF38u && ra != 0x08922F54u && ra != 0x08923164u) {
+            last_ra = ra;
+            std::cout << "[mainloop] uid=3 pc=" << hex32(current->context.pc) << " ra=" << hex32(ra) << " vblank=" << g_host.vblank_count << "\n" << std::flush;
+        }
+    }
     // Time just moved, so a delay that expired is runnable here. Without this a thread that only
     // ever waits on a deadline is woken solely when another thread blocks, and a guest that never
     // blocks leaves it parked forever even though its deadline is long past.
@@ -3002,6 +3009,18 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             if (shown < 3) {
                 ++shown;
                 std::cout << "[enq] list=" << hex32(list) << " stall=" << hex32(stall) << " ra=" << hex32(ctx.gpr[31]) << " thread=" << (current_thread() ? current_thread()->uid : 0u) << "\n" << std::flush;
+            }
+            static bool scanned = false;
+            if (!scanned && g_host.vblank_count > 5u) {
+                scanned = true;
+                std::uint32_t found = 0u;
+                for (std::uint32_t a = 0x08800000u; a < 0x0A000000u; a += 4u) {
+                    if (runtime.memory().aot_load32(a) == 0x08807EB4u) {
+                        std::cout << "[ptrscan] 0x08807EB4 found at " << hex32(a) << "\n" << std::flush;
+                        ++found;
+                    }
+                }
+                std::cout << "[ptrscan] total " << found << "\n" << std::flush;
             }
             const std::uint32_t id = g_host.next_ge_list_id++;
             g_host.ge_stall[id] = list;  // the list is consumed immediately: stall == start
