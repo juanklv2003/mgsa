@@ -2107,9 +2107,13 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     });
     bind("ThreadManForUser", 0x1FB15A32u, "sceKernelSetEventFlag", [](Runtime &runtime, AllegrexContext &ctx) {
         const std::uint32_t uid = ctx.gpr[4];
+        const std::uint32_t bits = ctx.gpr[5];
+        if (uid == 20u) {
+            std::cout << "[setflag] uid=20 set bits=" << hex32(bits) << " ra=" << hex32(ctx.gpr[31]) << "\n" << std::flush;
+        }
         for (auto &flag : g_host.event_flags) {
             if (flag.uid != uid) continue;
-            flag.bits |= ctx.gpr[5];
+            flag.bits |= bits;
             wake_waiting_threads(runtime, flag);
             ctx.gpr[2] = 0u;
             return;
@@ -2632,7 +2636,7 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         ctx.gpr[2] = got;
     });
     // sceIoLseek(fd, SceOff offset, int whence) -> SceOff in v0/v1
-    bind("IoFileMgrForUser", 0x27EB27B8u, "sceIoLseek", [](Runtime &, AllegrexContext &ctx) {
+    bind("IoFileMgrForUser", 0x27EB27B8u, "sceIoLseek", [](Runtime &runtime, AllegrexContext &ctx) {
         GuestFile *file = find_file(ctx.gpr[4]);
         if (file == nullptr) {
             ctx.gpr[2] = 0x80010009u;

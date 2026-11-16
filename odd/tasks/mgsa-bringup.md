@@ -192,3 +192,33 @@ this phase. The deliverable is the measurement, not playability.
   - **Conclusion: the black screen is the missing GE consumer.** Until the submitted sprites are
     rasterized into EDRAM there is nothing to look at, and no reading of guest counters can say
     whether the screen is a title logo or an empty frame. Next task is a software rasterizer.
+
+- **L7** — the frame list is fully decoded and the guest draws nothing but a no-op fade; the
+  blocker is the missing title scene, not a missing rasterizer.
+  - **Frame list decoded** (`[gedump]`): `CLEARMODE 0x00044000` + `CLEAR 0x00000200`, then a
+    118-command state block (viewport 240/-136, world/view/proj matrices, scissor (0,0)-(479,271),
+    ALPHATEST off, DEPTHTEST on, BLENDENABLE 0), then one `PRIM 0x04060002` (sprite, 2 verts) at
+    (0,0)-(480,272) in transparent black `0x00000000`, then `RET`. One draw per list, every frame,
+    for 8,705 frames / 145 s of guest time. A rasterizer would faithfully paint black.
+  - **sceDisplay bound honestly** (were one stub returning 0 and discarding args): SetFrameBuf keeps
+    topaddr/pitch/format/sync and reports them back via GetFrameBuf; SetMode/GetMode keep mode/
+    width/height. Measured: double-buffered `topaddr` 0x04000000 / 0x04044000, bufferwidth 512,
+    pixelformat 1 (5551), swapped every 2 frames.
+  - **Input is delivered and ignored** (bit-identical run with `--press 0x0008 --press-from 60`);
+    `[press]` confirms buttons reached 0x08B50090. The guest is not at an interactive screen.
+  - **arc (uid 5) dies after the init archive** and is never restarted: `arc_kick` (0x09C61600) has
+    zero static callers and zero runtime hits. `preseek` (uid 4) preseeks `stage/title/_zar`
+    (fd 318, 916,419 B) at frame 36 and exits. No thread is ever created again (only two
+    `sceKernelCreateThread` sites, both one-time init paths). The title archive is never read.
+  - **Event-flag protocol** (uid 20): arc waits for bit 2 (0x4); `SetEventFlag(0x3)` init and
+    `SetEventFlag(0x5)` (bits 0,2) are called by kjfs during init reads. For the title archive arc
+    is already dead, so even a perfect bit-2 set cannot wake it.
+  - **Savedata is not the blocker**: only `sceImpose::0x36AA6E91` is called (once); the other four
+    unbound NIDs (0x50C4CD57, 0x9790B33C, 0xD4B95FFB, 0x8874DBE0) are never invoked.
+  - **HLE experiment (re-arm arc on lseek-to-0) failed**: resetting guest state on a seek-to-zero and
+    re-starting arc made arc spin at 0x09C619B4 (a WaitEventFlag for bit 0x20 that never resolves).
+    The state struct layout and the re-arm trigger are not yet understood; experiment reverted.
+  - **Conclusion**: the black screen is the missing title scene load (arc dead + arc_kick never
+    called), not the missing rasterizer. Next step is deep RE of the arc_kick caller (BOOT.BIN main
+    loop ~0x088047B8, or the mgp_stage pointer table at 0x08B500A0) to find who is supposed to
+    kick the read-ahead for the title archive.
