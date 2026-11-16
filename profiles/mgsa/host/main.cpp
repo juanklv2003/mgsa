@@ -64,7 +64,7 @@ struct Block {
 };
 
 enum class ThreadState { Dormant, Ready, Running, Waiting, Dead };
-enum class WaitKind { None, Delay, Sleep, EventFlag, Semaphore, ThreadEnd };
+enum class WaitKind { None, Delay, Sleep, EventFlag, Semaphore, ThreadEnd, Vblank };
 
 // One guest thread. `uid` is the guest-visible handle and also this vector's index + 1, so a
 // handle the guest stores is stable for the whole run.
@@ -252,6 +252,10 @@ struct Host {
     std::vector<IntrHandler> queued_interrupts;
     bool interrupt_chain_active{};
     std::uint32_t vblank_count{};
+    // The virtual time at which the next frame boundary arrives. A wait for the display parks on
+    // this instant, so every thread that asks for a frame inside one period resumes on the same
+    // boundary and the clock advances one frame period per boundary, not one per caller.
+    std::uint64_t next_vblank_us{};
     std::uint32_t press_mask{};
     std::uint32_t press_from{300u};
     std::uint32_t press_seen{};
@@ -348,6 +352,9 @@ struct Host {
     // Temporary: where the guest spends its dispatches, so a long silent run can be
     // told apart from a tight guest-side loop without guessing. 4 KiB pages.
     std::unordered_map<std::uint32_t, std::uint64_t> page_dispatches;
+    // Temporary: the guest return addresses that drive imports. A thread parked in one loop keeps
+    // returning to the same handful of call sites, and each one names a function to read.
+    std::unordered_map<std::uint32_t, std::uint64_t> return_sites;
     // Temporary: the newest host calls, so a fault can name the call that led to it.
     std::vector<std::string> recent_imports;
     [[nodiscard]] std::uint32_t allocate(std::uint32_t size, std::uint32_t align) noexcept {
@@ -425,16 +432,24 @@ void enter_queued_interrupt(AllegrexContext &ctx) {
 // The first handler takes over ctx.pc, so the import wrapper that called this binding leaves that
 // pc alone and the runtime dispatches into guest code. Control comes back through
 // kModuleReturnSentinel, which resumes the next queued handler or returns to the wait.
+
 // Makes ready every thread whose delay has expired. A sleeping thread must be woken by time
-// passing, not only by another thread blocking, so schedule() calls this after advancing the
-// clock and every other time source is expected to call it too.
+// passing, not only by another thread blocking, so every time source calls this after advancing
+// the clock.
 void wake_expired_delays();
 
 void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
+    // A boundary is crossed only when guest time has actually reached it. The wait binding parks
+    // its caller until `next_vblank_us`, so the scheduler is what moves the clock here: one frame
+    // period of guest time per boundary, no matter how many threads are waiting on the display.
+    // Charging a period per caller instead makes five consumers fast-forward the guest's clock five
+    // times faster than the work it is doing, and every timeout in the game expires early.
     ++g_host.vblank_count;
-    // One frame of guest time. Without this the guest's own clock runs hundreds of times
-    // too slow, so every deadline, timeout and audio position it computes is wrong.
-    g_host.virtual_us += kFramePeriodUs;
+    g_host.next_vblank_us = g_host.virtual_us + kFramePeriodUs;
+    // A frame is time passing, so a thread that asked to sleep for less than a frame is now
+    // runnable. Only the state changes here: the vblank handler chain owns the CPU until it
+    // returns, and after_import picks the thread up at the next import boundary.
+    wake_expired_delays();
     // A pulse, not a hold: the guest reads the buffer once per frame, and a button that never
     // goes up looks the same as one that was never pressed.
     if (g_host.press_mask != 0u && g_host.vblank_count >= g_host.press_from) {
@@ -611,12 +626,16 @@ void switch_to(AllegrexContext &ctx, GuestThread &thread) {
 }
 
 // Makes ready every thread whose delay has expired. A sleeping thread must be woken by time
-// passing, not only by another thread blocking, so schedule() calls this after advancing the
-// clock and every other time source is expected to call it too.
+// passing, not only by another thread blocking, so every time source calls this after advancing
+// the clock. A display wait shares the same rule: it is parked on an instant, and that instant is
+// a fact about the clock, not about who else happens to be running.
 void wake_expired_delays() {
     for (auto &thread : g_host.threads) {
         if (thread.state != ThreadState::Waiting) continue;
-        if (thread.wait_kind != WaitKind::Delay && thread.wait_kind != WaitKind::Sleep) continue;
+        if (thread.wait_kind != WaitKind::Delay && thread.wait_kind != WaitKind::Sleep &&
+            thread.wait_kind != WaitKind::Vblank) {
+            continue;
+        }
         if (thread.wait_kind == WaitKind::Sleep && !thread.waiting_on_wakeup) continue;
         if (thread.wait_deadline_us > g_host.virtual_us) continue;
         thread.context.gpr[2] = 0u;
@@ -639,7 +658,12 @@ void schedule(Runtime &runtime, AllegrexContext &ctx) {
         bool any_deadline = false;
         for (auto &thread : g_host.threads) {
             if (thread.state != ThreadState::Waiting) continue;
-            if (thread.wait_kind != WaitKind::Delay && thread.wait_kind != WaitKind::Sleep) continue;
+            // A display wait is a deadline too: the frame boundary is the event that releases it,
+            // and it is the only event in a run where every thread is presenting frames.
+            if (thread.wait_kind != WaitKind::Delay && thread.wait_kind != WaitKind::Sleep &&
+                thread.wait_kind != WaitKind::Vblank) {
+                continue;
+            }
             if (thread.wait_kind == WaitKind::Sleep && !thread.waiting_on_wakeup) continue;
             if (!any_deadline || thread.wait_deadline_us < earliest) {
                 earliest = thread.wait_deadline_us;
@@ -720,6 +744,10 @@ void after_import(Runtime &runtime, AllegrexContext &ctx) {
     if (current == nullptr) return;
     g_host.virtual_us += 1u;
     ++g_host.imports_since_switch;
+    // Time just moved, so a delay that expired is runnable here. Without this a thread that only
+    // ever waits on a deadline is woken solely when another thread blocks, and a guest that never
+    // blocks leaves it parked forever even though its deadline is long past.
+    wake_expired_delays();
     GuestThread *best = best_ready_thread(current);
     if (best == nullptr) return;
     const bool higher = best->priority < current->priority;
@@ -1273,14 +1301,39 @@ Runtime::HleFunction make_prx_export_forwarder(std::string library, std::uint32_
             if (!frame_stack().empty()) {
                 std::cout << " frame_ra=" << hex32(frame_stack().back().return_ra);
             }
-            // Temporary: read mgp_stage's function pointers when cfg is called.
+            // Temporary: the config call's 0x80-byte struct is the only description of what the
+            // guest is asking for. Print it as text and as words instead of inferring it.
+            if (nid == 0x813E06ADu) {
+                const std::uint32_t base = ctx.gpr[4];
+                std::cout << " text=\"";
+                for (std::uint32_t i = 0u; i < 0x80u; ++i) {
+                    if (!runtime.memory().contains(base + i, 1u)) break;
+                    const std::uint8_t byte = runtime.memory().load8(base + i);
+                    if (byte == 0u) break;
+                    std::cout << (byte >= 0x20u && byte < 0x7Fu ? static_cast<char>(byte) : '.');
+                }
+                std::cout << "\" words=";
+                for (std::uint32_t i = 0u; i < 0x20u; ++i) {
+                    if (!runtime.memory().contains(base + i * 4u, 4u)) break;
+                    std::cout << " " << hex32(runtime.memory().load32(base + i * 4u));
+                }
+                std::cout << "\n stack=";
+                for (const auto &frame : frame_stack()) {
+                    std::cout << " k" << static_cast<int>(frame.kind) << ":" << hex32(frame.return_ra);
+                }
+            }
             std::cout << "\n" << std::flush;
         }
-        // Temporary: log mgp_stage's relocated instructions after load.
-        if (library == "mgp_stage_placeholder") { (void)0; }
-        // Temporary: read mgp_stage's relocated instructions after it's loaded.
-        // (logged separately below)
-        (void)0;
+        // Temporary: the inflate library is called hundreds of times while the screen stays black.
+        // Either it is making progress through a buffer, or it is retrying the same input forever,
+        // and the arguments of consecutive calls are the difference.
+        if (library == "zlibdec") {
+            std::cout << "[zlib] frame=" << g_host.vblank_count << " nid=" << hex32(nid)
+                      << " a0=" << hex32(ctx.gpr[4]) << " a1=" << hex32(ctx.gpr[5])
+                      << " a2=" << hex32(ctx.gpr[6]) << " a3=" << hex32(ctx.gpr[7])
+                      << " thread=" << g_host.current_thread_uid << "\n"
+                      << std::flush;
+        }
         // Temporary: which guest code calls into each module export, and when. The title archive
         // is opened at frame 36 by kjfs, and the caller's ra is the only way back to the game
         // function that owns that load.
@@ -1493,6 +1546,10 @@ void module_return_sentinel(Runtime &runtime, AllegrexContext &ctx) {
                 std::cout << "[kjfs] " << hex32(frame.nid) << " -> " << hex32(result) << " by='"
                           << (self == nullptr ? "?" : self->name) << "'\n" << std::flush;
             }
+        }
+        if (frame.nid == 0x461C7724u || frame.nid == 0x18CB51ABu || frame.nid == 0x216D1BF1u) {
+            std::cout << "[zlib] return " << hex32(frame.nid) << " v0=" << hex32(result) << "\n"
+                      << std::flush;
         }
         ctx.pc = frame.return_ra;
         break;
@@ -1799,6 +1856,10 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         thread.gp = ctx.gpr[28];
         thread.state = ThreadState::Dormant;
         g_host.threads.push_back(std::move(thread));
+        std::cout << "[thread] create uid=" << g_host.threads.size() << " '" << g_host.threads.back().name
+                  << "' entry=" << hex32(g_host.threads.back().entry)
+                  << " prio=" << g_host.threads.back().priority << " frame=" << g_host.vblank_count << "\n"
+                  << std::flush;
         ctx.gpr[2] = static_cast<std::uint32_t>(g_host.threads.size());
     });
     // sceKernelStartThread(uid, arg_len, arg_ptr)
@@ -1826,6 +1887,9 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         thread->context.gpr[29] = thread->stack_top;
         thread->context.gpr[31] = kThreadExitStub;
         make_ready(*thread);
+        std::cout << "[thread] start uid=" << thread->uid << " '" << thread->name << "' frame=" << g_host.vblank_count
+                  << "\n"
+                  << std::flush;
         ctx.gpr[2] = 0u;
     });
     bind("ThreadManForUser", 0xAA73C935u, "sceKernelExitThread", [](Runtime &runtime, AllegrexContext &ctx) {
@@ -3045,15 +3109,24 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             ctx.gpr[2] = 0u;
         });
 
-    // --- sceDisplay: no pixels, but a real frame clock. A vblank wait is not a no-op: it advances
-    // the counter and runs the guest's VBLANK handlers, which is the contract the game's
-    // "wait N frames" loops depend on. Without it they spin forever on a counter nothing writes.
+    // --- sceDisplay: no pixels, but a real frame clock. A vblank wait is not a no-op and it is not
+    // a free counter bump either: it parks the caller until guest time reaches the next frame
+    // boundary. Several threads waiting on the display in the same period all resume on that one
+    // boundary, so the clock advances one frame period per frame instead of one per caller.
     for (auto nid : {0x984C27E7u, 0x46F186C3u}) {  // WaitVblankStartCB / WaitVblankCB
         bind("sceDisplay", nid, "sceDisplayWaitVblank", [](Runtime &runtime, AllegrexContext &ctx) {
             // Temporary: who drives the frame loop. A frame counter that advances from one
             // guest function is a healthy loop; a spread means several subsystems each think
             // they own the display.
             if (ctx.gpr[31] != 0u) ++g_host.vblank_callers[ctx.gpr[31]];
+            // The boundary has not arrived yet, so this caller has to wait for it. The scheduler
+            // moves the clock to the boundary and wakes everyone parked on it.
+            if (g_host.virtual_us < g_host.next_vblank_us) {
+                block_current(runtime, ctx, WaitKind::Vblank, 0u, 0u, 0u, 0u, 0u,
+                              g_host.next_vblank_us - g_host.virtual_us);
+                ctx.gpr[2] = 0u;
+                return;
+            }
             advance_vblank(runtime, ctx);
             // A handler that took over ctx.pc resolves this value through the sentinel, which
             // returns 0 for the interrupted wait; an interrupt-free wait returns 0 here.
@@ -3169,12 +3242,15 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
     ++g_host.dispatches;
 
     ++g_host.page_dispatches[pc >> 12u];
+    ++g_host.return_sites[ctx.gpr[31]];
 
     // Temporary: a stall inside interpreted module code produces no output, so report progress
     // from the dispatcher while the wait is being identified.
     static std::uint64_t next_beat = 1'000'000u;
     if (g_host.dispatches >= next_beat) {
-        const bool first = next_beat == 1'000'000u;
+        static bool state_dumped = false;
+        const bool first = !state_dumped && g_host.vblank_count >= 300u;
+        if (first) state_dumped = true;
         next_beat += 1'000'000u;
         std::cout << "[beat] dispatch=" << g_host.dispatches << " pc=" << hex32(pc)
                   << " thread=" << g_host.current_thread_uid << " vus=" << g_host.virtual_us
@@ -3184,7 +3260,8 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
         // the guest itself named instead of guessed from an address.
         if (first) {
             for (const auto &thread : g_host.threads) {
-                std::cout << "[state] uid=" << thread.uid << " '" << thread.name << "' prio=" << thread.priority;
+                std::cout << "[state] uid=" << thread.uid << " '" << thread.name << "' prio=" << thread.priority
+                          << " pc=" << hex32(thread.context.pc) << " ra=" << hex32(thread.context.gpr[31]);
                 switch (thread.state) {
                     case ThreadState::Dormant: std::cout << " dormant"; break;
                     case ThreadState::Ready: std::cout << " ready"; break;
@@ -3213,6 +3290,10 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
             std::cout << "[state] flags:";
             for (const auto &flag : g_host.event_flags) {
                 std::cout << " " << flag.uid << "='" << flag.name << "'";
+            }
+            std::cout << "\n[state] frame stack:";
+            for (const auto &frame : frame_stack()) {
+                std::cout << " kind=" << static_cast<int>(frame.kind) << " back_to=" << hex32(frame.return_ra);
             }
             std::cout << "\n[state] semas:";
             for (const auto &sema : g_host.semas) {
@@ -3694,6 +3775,20 @@ int main(int argc, char **argv) {
                     static_cast<double>(g_host.dispatches == 0u ? 1u : g_host.dispatches);
                 std::cout << "    " << hex32(pages[i].first << 12u) << "  " << pages[i].second << "  "
                           << static_cast<int>(share * 10.0) / 10.0 << "%\n";
+            }
+        }
+
+        // Temporary: the return addresses that drive imports. Each is the instruction after a
+        // `jal` into an import stub, so it names the guest function doing the calling.
+        {
+            std::vector<std::pair<std::uint32_t, std::uint64_t>> sites(
+                g_host.return_sites.begin(), g_host.return_sites.end());
+            std::sort(sites.begin(), sites.end(),
+                [](const auto &left, const auto &right) { return left.second > right.second; });
+            const std::size_t shown = std::min<std::size_t>(sites.size(), 32u);
+            std::cout << "--- return sites (" << sites.size() << " distinct, top " << shown << ")\n";
+            for (std::size_t i = 0u; i < shown; ++i) {
+                std::cout << "    " << hex32(sites[i].first) << "  " << sites[i].second << "\n";
             }
         }
         return 0;

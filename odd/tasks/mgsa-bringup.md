@@ -156,3 +156,39 @@ this phase. The deliverable is the measurement, not playability.
   - **Next step:** decompile BOOT.BIN main loop with Ghidra to find the condition that gates title
     loading. Alternatively, experiment by setting memory flags/event flags.
   - Engram: saved as topic `mgsa-bringup/black-screen-root-cause`.
+
+- **L6** — the frame clock is now honest, and the black screen is a missing rasterizer, not a stuck guest.
+  - **Fixed the real scheduler defect.** `wake_expired_delays()` was only reachable from `schedule()`,
+    which runs when a thread blocks. The game's `Main` thread never blocks (it polls the display), so
+    four threads parked on long-expired deadlines (`preseek`, `arc`, `SDLOOP`, `sdfile.c`) stayed
+    frozen for the whole run. It is now called after every import, because time really did move.
+  - **Why waking them broke the boot before.** `advance_vblank` did `++vblank_count; virtual_us +=
+    16683` on *every* `sceDisplayWaitVblank` call. Five consumers each adding a frame period made
+    guest time advance five times faster than the work being done: 16,999 "frames" in 308k
+    dispatches, every timeout in the game expired early, and the boot never reached `fd 315`.
+  - **The fix: one boundary per frame period.** A display wait now parks the caller with
+    `WaitKind::Vblank` and a deadline of `next_vblank_us`; the scheduler moves the clock to that
+    instant, wakes everyone parked on it, and only then does a caller cross the boundary
+    (`++vblank_count`, `next_vblank_us = virtual_us + kFramePeriodUs`) and run the guest's VBLANK
+    handler chain in its own context, exactly as before. Measured: 1,426 frames, 713 GE lists,
+    23,893 ms of guest time, **16,755 us per frame** — one frame period, not five.
+  - **The boot completes.** `preseek` and `arc` now run and exit normally (frames 36 and 16).
+    `fd 315 stage/init/_zar` is read completely (3,338,158 B) and `fd 317 psq/e001system.psq`
+    completely (792,724 B).
+  - **`stage/title/_zar` is still opened and never read, and the reason is now named.** Thread
+    creation is logged: `arc` (entry `0x09C622B8`, the kjfs read-ahead worker) is created once, at
+    frame 0, and its loop exits as soon as the init archive is fully read (`0x12DC`: exit when the
+    write cursor reaches the byte limit). `preseek` (entry `0x09C62154`) is created at frame 0 but
+    *started* at frame 36; it opens the stage archive, seeks to 0, waits on sema `preseek`, then marks
+    its state and exits. No thread is ever created or started again, so nothing fills the ring for
+    `fd 318`. kjfs has exactly two `sceKernelCreateThread` call sites (`0x1228` for `preseek`,
+    `0x1680` for `arc`), both inside one-time init paths.
+  - **The guest is drawing, not hung.** Every submitted list is a `PRIM 0x04060002` — GE sprite,
+    2 vertices, i.e. a 2D quad — at roughly one list per two frames, with
+    `VERTEXTYPE 0x80011C` (through-mode, RGBA8 colour, 16-bit position, stride 12). The "228 distinct
+    GE commands" from L4 came from walking a 4,096-word scratch buffer at enqueue time; the real
+    draws are sane. `[vram] non_zero_words=0/524288` is therefore expected: the GE is modelled as
+    idle, so nothing is rasterized at all.
+  - **Conclusion: the black screen is the missing GE consumer.** Until the submitted sprites are
+    rasterized into EDRAM there is nothing to look at, and no reading of guest counters can say
+    whether the screen is a title logo or an empty frame. Next task is a software rasterizer.
