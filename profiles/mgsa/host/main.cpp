@@ -256,6 +256,15 @@ struct Host {
     // this instant, so every thread that asks for a frame inside one period resumes on the same
     // boundary and the clock advances one frame period per boundary, not one per caller.
     std::uint64_t next_vblank_us{};
+    // What the guest asked the display to show. The GE is idle, so these describe a black
+    // buffer, but the address and pitch are real guest state and GetFrameBuf must report them.
+    std::uint32_t frame_buffer{};
+    std::uint32_t frame_buffer_width{};
+    std::uint32_t frame_buffer_format{};
+    std::uint64_t frame_buffer_sets{};
+    std::uint32_t display_mode{};
+    std::uint32_t display_width{480u};
+    std::uint32_t display_height{272u};
     std::uint32_t press_mask{};
     std::uint32_t press_from{300u};
     std::uint32_t press_seen{};
@@ -1606,7 +1615,77 @@ struct GeListWalk {
     bool stopped_at_limit{};
 };
 
-GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t start, std::uint32_t limit = 0u) {
+// Names for the commands that appear in a real frame. Unknown commands print as hex, which is
+// the honest answer for a register this host has not decoded yet.
+const char *ge_command_name(std::uint32_t command) {
+    switch (command) {
+        case 0x01u: return "VADDR";
+        case 0x02u: return "IADDR";
+        case 0x04u: return "PRIM";
+        case 0x05u: return "BEZIER";
+        case 0x06u: return "SPLINE";
+        case 0x07u: return "BOUNDINGBOX";
+        case 0x08u: return "JUMP";
+        case 0x09u: return "CONDJUMP";
+        case 0x0Au: return "CALL";
+        case 0x0Bu: return "RET";
+        case 0x0Cu: return "END";
+        case 0x0Eu: return "SIGNAL";
+        case 0x0Fu: return "FINISH";
+        case 0x10u: return "BASE";
+        case 0x12u: return "VERTEXTYPE";
+        case 0x13u: return "OFFSETADDR";
+        case 0x14u: return "ORIGIN";
+        case 0x15u: return "REGION1";
+        case 0x16u: return "REGION2";
+        case 0x17u: return "LIGHTING";
+        case 0x1Du: return "CULLFACE";
+        case 0x1Eu: return "TEXMAPENABLE";
+        case 0x1Fu: return "FOGENABLE";
+        case 0x21u: return "BLENDENABLE";
+        case 0x22u: return "ALPHATESTENABLE";
+        case 0x23u: return "DEPTHTESTENABLE";
+        case 0x2Au: return "BONEMATRIXNUM";
+        case 0x2Bu: return "BONEMATRIXDATA";
+        case 0x3Au: return "WORLDMATRIXNUM";
+        case 0x3Bu: return "WORLDMATRIXDATA";
+        case 0x3Cu: return "VIEWMATRIXNUM";
+        case 0x3Du: return "VIEWMATRIXDATA";
+        case 0x3Eu: return "PROJMATRIXNUM";
+        case 0x3Fu: return "PROJMATRIXDATA";
+        case 0x42u: return "VIEWPORTXSCALE";
+        case 0x43u: return "VIEWPORTYSCALE";
+        case 0x44u: return "VIEWPORTZSCALE";
+        case 0x45u: return "VIEWPORTXCENTER";
+        case 0x46u: return "VIEWPORTYCENTER";
+        case 0x47u: return "VIEWPORTZCENTER";
+        case 0x4Cu: return "OFFSETX";
+        case 0x4Du: return "OFFSETY";
+        case 0x9Cu: return "CLEARMODE";
+        case 0x9Du: return "CLEAR";
+        case 0xA0u: return "TEXADDR0";
+        case 0xA8u: return "TEXBUFWIDTH0";
+        case 0xB8u: return "TEXSIZE0";
+        case 0xC2u: return "TEXMODE";
+        case 0xC3u: return "TEXFORMAT";
+        case 0xC9u: return "TEXFUNC";
+        case 0xCBu: return "TEXENVCOLOR";
+        case 0xD4u: return "SCISSOR1";
+        case 0xD5u: return "SCISSOR2";
+        case 0xD6u: return "MINZ";
+        case 0xD7u: return "MAXZ";
+        case 0xDBu: return "ALPHATEST";
+        case 0xDEu: return "DEPTHTEST";
+        case 0xDFu: return "BLENDMODE";
+        case 0xE0u: return "BLENDFIXEDA";
+        case 0xE1u: return "BLENDFIXEDB";
+        case 0xE7u: return "DEPTHWRITEDISABLE";
+        default: return nullptr;
+    }
+}
+
+GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t start, std::uint32_t limit = 0u,
+    bool verbose = false) {
     GeListWalk walk;
     std::uint32_t pc = start;
     // The GE encodes one word per command: the top byte names it and the low 24 bits carry
@@ -1649,6 +1728,20 @@ GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t star
         ++walk.commands;
         const std::uint32_t here = pc;
         pc += 4u;
+        if (verbose) {
+            const char *name = ge_command_name(command);
+            std::cout << "[gedump] " << hex32(here) << " " << hex32(word) << "  ";
+            if (name != nullptr) {
+                std::cout << name;
+            } else {
+                std::cout << "cmd0x" << std::hex << command << std::dec;
+            }
+            std::cout << " data=" << hex32(data);
+            if (command == 0x01u || command == 0x0Au || command == 0x08u) {
+                std::cout << " -> " << hex32(relative(data));
+            }
+            std::cout << "\n";
+        }
         if (command == 0x10u) {  // BASE
             base_extended = (data & 0x000F0000u) << 8u;
             continue;
@@ -3032,6 +3125,21 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         const auto start = g_host.ge_list_start.find(id);
         if (start != g_host.ge_list_start.end() && new_stall > start->second) {
             const GeListWalk walk = walk_ge_list(runtime.memory(), start->second, new_stall);
+            // Temporary: dump one complete real frame list. Counting commands says the guest
+            // submits work; the command sequence says what that work is, and that is the only
+            // way to tell a scene clear from a scene whose geometry never arrived.
+            {
+                static bool dumped_full = false;
+                if (!dumped_full && walk.draws != 0u) {
+                    dumped_full = true;
+                    std::cout << "[gedump] === full list frame " << g_host.vblank_count << " start="
+                              << hex32(start->second) << " stall=" << hex32(new_stall) << " ===\n";
+                    const GeListWalk ignored = walk_ge_list(runtime.memory(), start->second, new_stall, true);
+                    (void)ignored;
+                    std::cout << "[gedump] === end, commands=" << walk.commands
+                              << " draws=" << walk.draws << " ===\n" << std::flush;
+                }
+            }
             ++g_host.ge_incremental_walks;
             g_host.ge_incremental_draws += walk.draws;
             g_host.ge_incremental_vertices += walk.vertices;
@@ -3136,10 +3244,66 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     bind("sceDisplay", 0x9C6EAAD7u, "sceDisplayGetVcount", [](Runtime &, AllegrexContext &ctx) {
         ctx.gpr[2] = g_host.vblank_count;
     });
-    // Mode and buffer calls keep the stub behaviour: nothing reads pixels back yet.
-    for (auto nid : {0x0E20F177u, 0x289D82FEu, 0xEEDA2E54u}) {
-        bind("sceDisplay", nid, "display", [](Runtime &, AllegrexContext &ctx) { ctx.gpr[2] = 0u; });
-    }
+    // sceDisplaySetFrameBuf(topaddr, bufferwidth, pixelformat, sync). The display really does
+    // show the buffer the guest names, so the address has to be kept: a host that discards it
+    // cannot tell a black screen from a screen showing the wrong memory. The GE is still idle,
+    // so the buffer stays black until something rasterizes into it.
+    bind("sceDisplay", 0x289D82FEu, "sceDisplaySetFrameBuf", [](Runtime &runtime, AllegrexContext &ctx) {
+        g_host.frame_buffer = ctx.gpr[4];
+        g_host.frame_buffer_width = ctx.gpr[5];
+        g_host.frame_buffer_format = ctx.gpr[6];
+        ++g_host.frame_buffer_sets;
+        static std::uint32_t last_top = 0u;
+        static std::uint32_t last_width = 0u;
+        static std::uint32_t last_format = 0u;
+        if (ctx.gpr[4] != last_top || ctx.gpr[5] != last_width || ctx.gpr[6] != last_format) {
+            last_top = ctx.gpr[4];
+            last_width = ctx.gpr[5];
+            last_format = ctx.gpr[6];
+            std::cout << "[display] frame " << g_host.vblank_count << " topaddr=" << hex32(ctx.gpr[4])
+                      << " bufferwidth=" << ctx.gpr[5] << " pixelformat=" << ctx.gpr[6]
+                      << " sync=" << ctx.gpr[7] << "\n" << std::flush;
+        }
+        ctx.gpr[2] = 0u;
+    });
+    // sceDisplayGetFrameBuf(SceDisplayFrameBuf *buf, sync). Reporting success without writing the
+    // struct leaves the caller reading its own stale stack, so fill in what was really set.
+    bind("sceDisplay", 0xEEDA2E54u, "sceDisplayGetFrameBuf", [](Runtime &runtime, AllegrexContext &ctx) {
+        const std::uint32_t out = ctx.gpr[4];
+        if (out == 0u) {
+            ctx.gpr[2] = 0x80110603u;  // SCE_UTILITY_INVALID_PARAM
+            return;
+        }
+        // SceDisplayFrameBuf: size, base, pitch, pixelformat, reserved[4]
+        runtime.memory().store32(out + 0u, 0x20u);
+        runtime.memory().store32(out + 4u, g_host.frame_buffer);
+        runtime.memory().store32(out + 8u, g_host.frame_buffer_width);
+        runtime.memory().store32(out + 12u, g_host.frame_buffer_format);
+        for (std::uint32_t i = 0u; i < 4u; ++i) runtime.memory().store32(out + 16u + i * 4u, 0u);
+        ctx.gpr[2] = 0u;
+    });
+    // Mode is a real piece of guest-visible state: the game reads it back to size its buffers.
+    bind("sceDisplay", 0x0E20F177u, "sceDisplaySetMode", [](Runtime &, AllegrexContext &ctx) {
+        g_host.display_mode = ctx.gpr[4];
+        g_host.display_width = ctx.gpr[5];
+        g_host.display_height = ctx.gpr[6];
+        std::cout << "[display] mode=" << ctx.gpr[4] << " width=" << ctx.gpr[5] << " height=" << ctx.gpr[6]
+                  << "\n" << std::flush;
+        ctx.gpr[2] = 0u;
+    });
+    bind("sceDisplay", 0xDEA197D4u, "sceDisplayGetMode", [](Runtime &runtime, AllegrexContext &ctx) {
+        const std::uint32_t mode_out = ctx.gpr[4];
+        const std::uint32_t width_out = ctx.gpr[5];
+        const std::uint32_t height_out = ctx.gpr[6];
+        if (mode_out == 0u || width_out == 0u || height_out == 0u) {
+            ctx.gpr[2] = 0x80110603u;
+            return;
+        }
+        runtime.memory().store32(mode_out, g_host.display_mode);
+        runtime.memory().store32(width_out, g_host.display_width);
+        runtime.memory().store32(height_out, g_host.display_height);
+        ctx.gpr[2] = 0u;
+    });
     // sceDisplayGetAccumulatedHCount reports the raster position as a running total. The host
     // has no raster, but the count is a monotonic clock the guest may diff for timing, so it
     // advances with the frame clock instead of sticking at zero.
