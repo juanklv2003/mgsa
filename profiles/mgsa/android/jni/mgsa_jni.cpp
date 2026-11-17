@@ -1,0 +1,158 @@
+// mgsa Android entry: android_native_app_glue NativeActivity.
+// Creates the window, runs the guest loop (mgsa_main) on a worker thread,
+// renders the guest's EDRAM frame via ANativeWindow, and forwards touch events
+// into the same TouchLayer the sceCtrl HLE drains. No SDL, no Vulkan.
+#include <android/native_activity.h>
+#include <android/native_window.h>
+#include <android/input.h>
+#include <android/looper.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+// C API from main.cpp (compiled with -DMGSA_ANDROID_LIBRARY).
+extern "C" {
+void mgsa_enable_touch();
+void mgsa_touch_event(int kind, int id, float x, float y);
+int  mgsa_read_frame(std::uint8_t *dst, int dst_len);
+int  mgsa_frame_width();
+int  mgsa_frame_height();
+int  mgsa_main(int argc, char **argv);
+}
+
+namespace {
+
+struct App {
+    android_app *app{nullptr};
+    std::atomic<bool> running{true};
+    std::atomic<bool> guest_done{false};
+    pthread_t guest_thread{};
+};
+
+App g_app;
+
+int32_t on_input(android_app *app, AInputEvent *event) {
+    (void)app;
+    const int32_t type = AInputEvent_getType(event);
+    if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
+
+    const int32_t action = AMotionEvent_getAction(event);
+    const int32_t index = (action & AMOTION_EVENT_ACTION_MASK);
+    const float screen_w = static_cast<float>(ANativeWindow_getWidth(app->window));
+    const float screen_h = static_cast<float>(ANativeWindow_getHeight(app->window));
+    if (screen_w <= 0.0f || screen_h <= 0.0f) return 0;
+
+    const auto px = [&](std::size_t p) {
+        return AMotionEvent_getX(event, p) / screen_w * 480.0f;
+    };
+    const auto py = [&](std::size_t p) {
+        return AMotionEvent_getY(event, p) / screen_h * 272.0f;
+    };
+
+    if (index == AMOTION_EVENT_ACTION_DOWN ||
+        index == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+        const std::size_t p = (index == AMOTION_EVENT_ACTION_POINTER_DOWN)
+                                  ? static_cast<std::size_t>((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
+                                                             >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT)
+                                  : 0u;
+        const int id = AMotionEvent_getPointerId(event, p);
+        mgsa_touch_event(0, id, px(p), py(p));
+    } else if (index == AMOTION_EVENT_ACTION_UP ||
+               index == AMOTION_EVENT_ACTION_POINTER_UP) {
+        const std::size_t p = (index == AMOTION_EVENT_ACTION_POINTER_UP)
+                                  ? static_cast<std::size_t>((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
+                                                             >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT)
+                                  : 0u;
+        const int id = AMotionEvent_getPointerId(event, p);
+        mgsa_touch_event(2, id, px(p), py(p));
+    } else if (index == AMOTION_EVENT_ACTION_MOVE) {
+        const std::size_t count = AMotionEvent_getPointerCount(event);
+        for (std::size_t p = 0u; p < count; ++p) {
+            const int id = AMotionEvent_getPointerId(event, p);
+            mgsa_touch_event(1, id, px(p), py(p));
+        }
+    }
+    return 1;
+}
+
+void *guest_main(void *) {
+    mgsa_enable_touch();
+    // The disc image is installed in the app's files dir by the launcher.
+    // Paths are passed to mgsa_main like the desktop CLI.
+    char arg0[] = "mgsa";
+    char arg1[] = "--root";
+    char arg2[] = "/data/data/io.github.juanklv2003.mgsa/files/extract";
+    char *argv[] = {arg0, arg1, arg2};
+    mgsa_main(3, argv);
+    g_app.guest_done.store(true);
+    return nullptr;
+}
+
+void render(android_app *app) {
+    if (app->window == nullptr) return;
+    const int w = ANativeWindow_getWidth(app->window);
+    const int h = ANativeWindow_getHeight(app->window);
+    if (w <= 0 || h <= 0) return;
+
+    const int fw = mgsa_frame_width();
+    const int fh = mgsa_frame_height();
+    if (fw <= 0 || fh <= 0) return;
+    std::vector<std::uint8_t> frame(static_cast<std::size_t>(fw) * fh * 4u);
+    if (mgsa_read_frame(frame.data(), static_cast<int>(frame.size())) == 0) return;
+
+    ANativeWindow_Buffer buf;
+    if (ANativeWindow_lock(app->window, &buf, nullptr) != 0) return;
+    const int copy_w = fw < buf.width ? fw : buf.width;
+    const int copy_h = fh < buf.height ? fh : buf.height;
+    if (buf.format == AWINDOW_FORMAT_RGBA_8888) {
+        for (int y = 0; y < copy_h; ++y) {
+            std::uint8_t *dst = static_cast<std::uint8_t *>(buf.bits) + y * buf.stride * 4u;
+            const std::uint8_t *src = frame.data() + static_cast<std::size_t>(y) * fw * 4u;
+            std::memcpy(dst, src, static_cast<std::size_t>(copy_w) * 4u);
+        }
+    }
+    ANativeWindow_unlockAndPost(app->window);
+}
+
+void on_cmd(android_app *app, int32_t cmd) {
+    switch (cmd) {
+        case APP_CMD_INIT_WINDOW:
+            if (g_app.guest_thread == 0u) {
+                pthread_create(&g_app.guest_thread, nullptr, guest_main, nullptr);
+            }
+            break;
+        case APP_CMD_TERM_WINDOW:
+            g_app.running.store(false);
+            break;
+        default:
+            break;
+    }
+}
+
+}  // namespace
+
+void android_main(android_app *app) {
+    app_dummy();
+    g_app.app = app;
+    app->onAppCmd = on_cmd;
+    app->onInputEvent = on_input;
+
+    int events;
+    android_poll_source *source;
+    while (g_app.running.load()) {
+        const int timeout = (app->window != nullptr) ? 0 : -1;
+        while (ALooper_pollAll(timeout, nullptr, &events, reinterpret_cast<void **>(&source)) >= 0) {
+            if (source != nullptr) source->process(app, source);
+            if (app->destroyRequested != 0) {
+                g_app.running.store(false);
+                break;
+            }
+        }
+        if (app->window != nullptr) render(app);
+    }
+    if (g_app.guest_thread != 0u) pthread_join(g_app.guest_thread, nullptr);
+}
