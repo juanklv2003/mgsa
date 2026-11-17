@@ -447,6 +447,8 @@ void enter_queued_interrupt(AllegrexContext &ctx) {
 // the clock.
 void wake_expired_delays();
 
+static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t start,
+    std::uint32_t fb_base, std::uint32_t width, std::uint32_t height);
 void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     // A boundary is crossed only when guest time has actually reached it. The wait binding parks
     // its caller until `next_vblank_us`, so the scheduler is what moves the clock here: one frame
@@ -454,6 +456,16 @@ void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     // Charging a period per caller instead makes five consumers fast-forward the guest's clock five
     // times faster than the work it is doing, and every timeout in the game expires early.
     ++g_host.vblank_count;
+    // Rasterize the submitted display lists into EDRAM at frame boundary.
+    {
+        const std::uint32_t fb = g_host.frame_buffer != 0u ? g_host.frame_buffer : 0x04000000u;
+        for (std::size_t i = 0u; i < g_host.next_ge_list_id && i < 64u; ++i) {
+            const std::uint32_t start = g_host.ge_list_start[i];
+            if (start != 0u && g_host.runtime != nullptr) {
+                rasterize_ge_list(const_cast<psprecomp::GuestMemory &>(g_host.runtime->memory()), start, fb, 512u, 272u);
+            }
+        }
+    }
     g_host.next_vblank_us = g_host.virtual_us + kFramePeriodUs;
     // A frame is time passing, so a thread that asked to sleep for less than a frame is now
     // runnable. Only the state changes here: the vblank handler chain owns the CPU until it
@@ -1877,6 +1889,198 @@ GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t star
     }
     return walk;
 }
+
+// Software rasterizer for the GE display lists. Writes pixels to EDRAM (the guest's
+// frame buffer). Handles sprites (type 6) and triangles (type 3) with solid colors.
+// Texture support is a follow-up; the immediate goal is to turn the all-transparent
+// frame into something visible once the title scene loads.
+static void rasterize_sprite(psprecomp::GuestMemory &memory,
+                             std::uint32_t fb_base, std::uint32_t width, std::uint32_t height,
+                             std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1,
+                             std::uint32_t color) {
+    const std::uint16_t r = (color >> 0) & 0x1F;
+    const std::uint16_t g = (color >> 5) & 0x1F;
+    const std::uint16_t b = (color >> 10) & 0x1F;
+    const std::uint16_t a = (color >> 15) & 0x1;
+    const std::uint32_t pixel = (a << 15) | (b << 10) | (g << 5) | r;
+    const std::uint32_t x_lo = x0 < x1 ? x0 : x1;
+    const std::uint32_t x_hi = x0 < x1 ? x1 : x0;
+    const std::uint32_t y_lo = y0 < y1 ? y0 : y1;
+    const std::uint32_t y_hi = y0 < y1 ? y1 : y0;
+    for (std::uint32_t y = y_lo; y < y_hi && y < height; ++y) {
+        for (std::uint32_t x = x_lo; x < x_hi && x < width; ++x) {
+            const std::uint32_t addr = fb_base + (y * width + x) * 2u;
+            if (memory.contains(addr, 2u)) {
+                memory.store16(addr, static_cast<std::uint16_t>(pixel));
+            }
+        }
+    }
+}
+
+// Decode a vertex position from a display list. Returns (x, y, z) as s16.
+static void decode_vertex_pos(const psprecomp::GuestMemory &memory, std::uint32_t vtype,
+                              std::uint32_t vertex_address, std::uint32_t index, std::uint32_t stride,
+                              std::int16_t &x, std::int16_t &y, std::int16_t &z) {
+    x = 0; y = 0; z = 0;
+    const std::uint32_t color_type = (vtype >> 2) & 7u;
+    const std::uint32_t normal_type = (vtype >> 5) & 3u;
+    const std::uint32_t position_type = (vtype >> 7) & 3u;
+    const std::uint32_t texcoord_type = vtype & 3u;
+    // Field order: weights -> texcoords -> color -> normal -> position
+    static const std::uint32_t kCompSize[4] = {0, 1, 2, 4};
+    static const std::uint32_t kColorSize[8] = {0, 0, 0, 0, 2, 2, 2, 4};
+    // Compute offsets
+    std::uint32_t off = 0;
+    // weights
+    const std::uint32_t weight_type = (vtype >> 9) & 3u;
+    const std::uint32_t weight_count = ((vtype >> 14) & 7u) + 1u;
+    const std::uint32_t weight_size = kCompSize[weight_type];
+    if (weight_size > 0) {
+        const std::uint32_t field_size = weight_count * weight_size;
+        const std::uint32_t aligned = (field_size + weight_size - 1) / weight_size * weight_size;
+        off += aligned;
+    }
+    // texcoords
+    const std::uint32_t tc_size = kCompSize[texcoord_type];
+    if (tc_size > 0) {
+        const std::uint32_t aligned = (off + tc_size - 1) / tc_size * tc_size;
+        off = aligned + tc_size;
+    }
+    // color
+    const std::uint32_t col_size = kColorSize[color_type];
+    if (col_size > 0) {
+        const std::uint32_t aligned = (off + col_size - 1) / col_size * col_size;
+        off = aligned + col_size;
+    }
+    // normal
+    const std::uint32_t norm_size = kCompSize[normal_type];
+    if (norm_size > 0) {
+        const std::uint32_t aligned = (off + norm_size - 1) / norm_size * norm_size;
+        off = aligned + norm_size * (normal_type == 3 ? 3 : 1);
+    }
+    // position
+    const std::uint32_t pos_size = kCompSize[position_type];
+    const std::uint32_t pos_offset = off;
+    // Read position
+    const std::uint32_t addr = vertex_address + index * stride + pos_offset;
+    if (position_type == 2 && memory.contains(addr + 4, 4u)) {  // s16
+        x = static_cast<std::int16_t>(memory.aot_load16(addr));
+        y = static_cast<std::int16_t>(memory.aot_load16(addr + 2));
+        z = static_cast<std::int16_t>(memory.aot_load16(addr + 4));
+    } else if (position_type == 3 && memory.contains(addr + 12, 4u)) {  // f32
+        // skip f32 for now
+    }
+}
+
+static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t start,
+                              std::uint32_t fb_base, std::uint32_t width, std::uint32_t height) {
+    std::uint32_t pc = start;
+    std::uint32_t base_extended = 0u;
+    std::uint32_t offset_address = 0u;
+    std::uint32_t vertex_address = 0u;
+    std::uint32_t vertex_type = 0u;
+    std::uint32_t texture_enabled = 0u;
+    for (std::size_t step = 0u; step < 400000u; ++step) {
+        if (!memory.contains(pc, 4u)) break;
+        const std::uint32_t word = memory.aot_load32(pc);
+        const std::uint32_t command = word >> 24u;
+        const std::uint32_t data = word & 0x00FFFFFFu;
+        pc += 4u;
+        const auto relative = [&](std::uint32_t d) {
+            return (offset_address + (base_extended | (d & 0x00FFFFFFu))) & 0x0FFFFFFFu;
+        };
+        if (command == 0x10u) { base_extended = (data & 0x000F0000u) << 8u; continue; }
+        if (command == 0x13u) { offset_address = data << 8u; continue; }
+        if (command == 0x14u) { offset_address = pc - 4u; continue; }
+        if (command == 0x01u) { vertex_address = relative(data); continue; }
+        if (command == 0x12u) { vertex_type = data; continue; }
+        if (command == 0x1Eu) { texture_enabled = data & 1u; continue; }
+        if (command == 0x04u) {  // PRIM
+            const std::uint32_t count = data & 0xFFFFu;
+            const std::uint32_t primitive = (data >> 16u) & 7u;
+            if (count == 0) continue;
+            // Decode vertex stride
+            const std::uint32_t color_type = (vertex_type >> 2) & 7u;
+            const std::uint32_t normal_type = (vertex_type >> 5) & 3u;
+            const std::uint32_t position_type = (vertex_type >> 7) & 3u;
+            const std::uint32_t texcoord_type = vertex_type & 3u;
+            static const std::uint32_t kCompSize[4] = {0, 1, 2, 4};
+            static const std::uint32_t kColorSize[8] = {0, 0, 0, 0, 2, 2, 2, 4};
+            // Compute stride
+            std::uint32_t off = 0;
+            const std::uint32_t weight_type = (vertex_type >> 9) & 3u;
+            const std::uint32_t weight_count = ((vertex_type >> 14) & 7u) + 1u;
+            const std::uint32_t weight_size = kCompSize[weight_type];
+            if (weight_size > 0) {
+                const std::uint32_t field_size = weight_count * weight_size;
+                const std::uint32_t aligned = ((field_size + weight_size - 1) / weight_size) * weight_size;
+                off += aligned;
+            }
+            const std::uint32_t tc_size = kCompSize[texcoord_type];
+            if (tc_size > 0) {
+                const std::uint32_t aligned = (off + tc_size - 1) / tc_size * tc_size;
+                off = aligned + tc_size;
+            }
+            const std::uint32_t col_size = kColorSize[color_type];
+            if (col_size > 0) {
+                const std::uint32_t aligned = (off + col_size - 1) / col_size * col_size;
+                off = aligned + col_size;
+            }
+            const std::uint32_t norm_size = kCompSize[normal_type];
+            if (norm_size > 0) {
+                const std::uint32_t num_normals = (normal_type == 3) ? 3 : 1;
+                const std::uint32_t aligned = (off + norm_size - 1) / norm_size * norm_size;
+                off = aligned + norm_size * num_normals;
+            }
+            const std::uint32_t pos_size = kCompSize[position_type];
+            const std::uint32_t pos_offset = off;
+            const std::uint32_t stride = (off + pos_size - 1) / (pos_size > 0 ? pos_size : 1) * (pos_size > 0 ? pos_size : 1);
+            const std::uint32_t final_stride = (stride + 3) & ~3u;  // align to 4
+            // Actually, stride is aligned to largest component. Let's use off + pos_size, aligned up.
+            const std::uint32_t vertex_stride = ((off + pos_size + 3) / 4) * 4;
+            // Read color offset
+            std::uint32_t color_offset = 0;
+            {
+                std::uint32_t o = 0;
+                const std::uint32_t wt = (vertex_type >> 9) & 3u;
+                const std::uint32_t wc = ((vertex_type >> 14) & 7u) + 1u;
+                const std::uint32_t ws = kCompSize[wt];
+                if (ws > 0) { const std::uint32_t fs = wc * ws; o += ((fs + ws - 1) / ws) * ws; }
+                const std::uint32_t ts = kCompSize[texcoord_type];
+                if (ts > 0) { o = (o + ts - 1) / ts * ts + ts; }
+                const std::uint32_t cs = kColorSize[color_type];
+                if (cs > 0) { color_offset = (o + cs - 1) / cs * cs; }
+            }
+            if (primitive == 6u) {  // Sprites: pairs of vertices
+                for (std::uint32_t i = 0u; i + 1 < count; i += 2) {
+                    std::int16_t x0, y0, z0, x1, y1, z1;
+                    decode_vertex_pos(memory, vertex_type, vertex_address, i, vertex_stride, x0, y0, z0);
+                    decode_vertex_pos(memory, vertex_type, vertex_address, i + 1, vertex_stride, x1, y1, z1);
+                    // Read color from first vertex
+                    std::uint32_t color = 0xFFFFFFFFu;
+                    if (color_type > 3 && memory.contains(vertex_address + i * vertex_stride + color_offset, 4u)) {
+                        color = memory.aot_load32(vertex_address + i * vertex_stride + color_offset);
+                    } else if (color_type > 3 && memory.contains(vertex_address + i * vertex_stride + color_offset, 2u)) {
+                        color = memory.aot_load16(vertex_address + i * vertex_stride + color_offset);
+                    }
+                    rasterize_sprite(memory, fb_base, width, height, x0, y0, x1, y1, color);
+                }
+            } else if (primitive == 3u) {  // Triangles
+                // Simple: just skip for now (need scanline fill)
+            }
+            continue;
+        }
+        if (command == 0x08u) { pc = relative(data) & 0x0FFFFFFCu; continue; }
+        if (command == 0x0Au) {
+            const std::uint32_t target = relative(data) & 0x0FFFFFFCu;
+            // For simplicity, don't follow CALLs in rasterizer
+            continue;
+        }
+        if (command == 0x0Bu) break;  // RET
+        if (command == 0x0Cu || command == 0x0Fu) break;  // END/FINISH
+    }
+}
+
 
 void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     auto bind = [&runtime, &bound](const char *library, std::uint32_t nid, const char *name,
