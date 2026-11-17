@@ -45,6 +45,7 @@ struct TouchEvent {
     std::uint32_t id;
     float x;  // normalized 0..480
     float y;  // normalized 0..272
+    std::uint32_t at_frame{0};  // 0 = immediate; else fire at this poll frame
 };
 
 // The state the HLE copies into SceCtrlData: buttons at +4, lx at +8, ly at +9.

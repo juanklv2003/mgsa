@@ -20,6 +20,10 @@ InputState TouchLayer::poll() {
     std::size_t budget = queue_.size();
     while (budget-- > 0 && !queue_.empty()) {
         TouchEvent e = queue_.front();
+        if (e.at_frame != 0u && e.at_frame > frame_) {
+            queue_.push_back(e);
+            continue;
+        }
         queue_.pop_front();
 
         if (e.kind == TouchEvent::Down) {
@@ -109,17 +113,19 @@ std::size_t TouchLayer::load_file(const std::string &path) {
         std::istringstream ss(line);
         std::string kind;
         if (!(ss >> kind)) continue;
+        std::uint32_t at = 0u;
+        if (kind == "at") { ss >> at; if (!(ss >> kind)) continue; }
         if (kind == "up") {
             std::uint32_t id;
             if (ss >> id) {
-                push({TouchEvent::Up, id, 0.0f, 0.0f});
+                push({TouchEvent::Up, id, 0.0f, 0.0f, at});
                 ++count;
             }
         } else if (kind == "down" || kind == "move") {
             std::uint32_t id;
             float x, y;
             if (ss >> id >> x >> y) {
-                push({kind == "down" ? TouchEvent::Down : TouchEvent::Move, id, x, y});
+                push({kind == "down" ? TouchEvent::Down : TouchEvent::Move, id, x, y, at});
                 ++count;
             }
         }
