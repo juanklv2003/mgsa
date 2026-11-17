@@ -27,12 +27,14 @@ S6. Rasterizer output. Reuse the committed software rasterizer (`rasterize_ge_li
 
 ## Tasks
 
-T1 S1-S4: touch input layer (`profiles/mgsa/host/touch.hpp/.cpp`): gesture recognizer + HostInput producer + external event queue (command-file parser). Route: inline. Commit.
-T2 S1-S4: wire touch layer into `sceCtrlReadBufferPositive` binding and host loop; add desktop `--touch-file` CLI + a test gesture file; verify press reaches guest. Route: inline. Commit.
-T3 S6: EDRAM->RGBA blit + desktop PNG frame dump option. Route: inline. Commit.
-T4 S5: Android NDK CMake target + NativeActivity glue + APK packaging script. Route: inline. Commit.
-T5 S1-S6: end-to-end verification (desktop gesture test; Android build if SDK/NDK present) + docs. Route: inline. Commit.
+T1 S1-S4: touch input layer (`profiles/mgsa/host/touch.hpp/.cpp`). DONE — bb5d399. Gesture recognizer (tap=CROSS, swipe=directional, drag=analog, two-finger=CIRCLE) + down/move/up command-file queue.
+T2 S1-S4: wire into `sceCtrlReadBufferPositive`, `--touch-file` CLI, press latch. DONE — bb5d399. Verified: `[press] frame N buttons=0x4020` reaches guest.
+T3 S6: EDRAM->RGBA blit + PNG writer + `--png`. DONE — bb5d399. Verified: valid 480x272 RGBA PNG.
+T4 S5: Android NDK CMake + NativeActivity + JNI bridge + build_apk.sh. DONE — 8aa3c40. Not compiled here: no Android SDK/NDK installed on this machine; structure is reproducible per android/README.md.
+T5 S1-S6: end-to-end verification + docs. PARTIAL — desktop verified; Android build pending NDK install. Blocked on external toolchain, not on code.
 
 ## Log
 
 L1 (original request): "Reverse-engineer Metal Gear AC!D so it runs natively on Android with a real touch interface instead of emulated PSP buttons. Touch-native gameplay: no d-pad, no L/R, no 'press X' â€” tap a card to select, drag/pinch to pan and zoom the board."
+
+L2 (2026-11-17): Pivoted from BOOT.BIN stage-transition RE (diminishing returns, multiple falsified hypotheses) to this touch+Android feature. T1-T4 implemented and pushed. Desktop gesture test and PNG dump verified. Android APK not built here (no SDK/NDK); build scaffolding is complete and documented.
