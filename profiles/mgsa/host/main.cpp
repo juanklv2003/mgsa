@@ -1891,9 +1891,7 @@ GeListWalk walk_ge_list(const psprecomp::GuestMemory &memory, std::uint32_t star
 }
 
 // Software rasterizer for the GE display lists. Writes pixels to EDRAM (the guest's
-// frame buffer). Handles sprites (type 6) and triangles (type 3) with solid colors.
-// Texture support is a follow-up; the immediate goal is to turn the all-transparent
-// frame into something visible once the title scene loads.
+// frame buffer). Handles sprites (type 6) with solid colors and CLUT4 textures.
 static void rasterize_sprite(psprecomp::GuestMemory &memory,
                              std::uint32_t fb_base, std::uint32_t width, std::uint32_t height,
                              std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1,
@@ -1917,7 +1915,37 @@ static void rasterize_sprite(psprecomp::GuestMemory &memory,
     }
 }
 
-// Decode a vertex position from a display list. Returns (x, y, z) as s16.
+// Decode texcoord (u, v) from a vertex. Returns (u, v) as s16.
+static void decode_vertex_tc(const psprecomp::GuestMemory &memory, std::uint32_t vtype,
+                            std::uint32_t vertex_address, std::uint32_t index, std::uint32_t stride,
+                            std::int16_t &u, std::int16_t &v) {
+    u = 0; v = 0;
+    const std::uint32_t texcoord_type = vtype & 3u;
+    static const std::uint32_t kCompSize[4] = {0, 1, 2, 4};
+    const std::uint32_t tc_size = kCompSize[texcoord_type];
+    if (tc_size == 0) return;
+    // Compute texcoord offset: weights -> texcoords
+    std::uint32_t off = 0;
+    const std::uint32_t weight_type = (vtype >> 9) & 3u;
+    const std::uint32_t weight_count = ((vtype >> 14) & 7u) + 1u;
+    const std::uint32_t weight_size = kCompSize[weight_type];
+    if (weight_size > 0) {
+        const std::uint32_t field_size = weight_count * weight_size;
+        const std::uint32_t aligned = ((field_size + weight_size - 1) / weight_size) * weight_size;
+        off += aligned;
+    }
+    // texcoord offset (aligned to tc_size)
+    const std::uint32_t tc_offset = (off + tc_size - 1) / tc_size * tc_size;
+    const std::uint32_t addr = vertex_address + index * stride + tc_offset;
+    if (texcoord_type == 2 && memory.contains(addr + 2, 2u)) {  // s16
+        u = static_cast<std::int16_t>(memory.aot_load16(addr));
+        v = static_cast<std::int16_t>(memory.aot_load16(addr + 2));
+    } else if (texcoord_type == 3 && memory.contains(addr + 4, 4u)) {  // f32
+        // skip for now
+    }
+}
+
+// Decode vertex position (same as before)
 static void decode_vertex_pos(const psprecomp::GuestMemory &memory, std::uint32_t vtype,
                               std::uint32_t vertex_address, std::uint32_t index, std::uint32_t stride,
                               std::int16_t &x, std::int16_t &y, std::int16_t &z) {
@@ -1926,50 +1954,64 @@ static void decode_vertex_pos(const psprecomp::GuestMemory &memory, std::uint32_
     const std::uint32_t normal_type = (vtype >> 5) & 3u;
     const std::uint32_t position_type = (vtype >> 7) & 3u;
     const std::uint32_t texcoord_type = vtype & 3u;
-    // Field order: weights -> texcoords -> color -> normal -> position
     static const std::uint32_t kCompSize[4] = {0, 1, 2, 4};
     static const std::uint32_t kColorSize[8] = {0, 0, 0, 0, 2, 2, 2, 4};
-    // Compute offsets
     std::uint32_t off = 0;
-    // weights
     const std::uint32_t weight_type = (vtype >> 9) & 3u;
     const std::uint32_t weight_count = ((vtype >> 14) & 7u) + 1u;
     const std::uint32_t weight_size = kCompSize[weight_type];
     if (weight_size > 0) {
         const std::uint32_t field_size = weight_count * weight_size;
-        const std::uint32_t aligned = (field_size + weight_size - 1) / weight_size * weight_size;
+        const std::uint32_t aligned = ((field_size + weight_size - 1) / weight_size) * weight_size;
         off += aligned;
     }
-    // texcoords
     const std::uint32_t tc_size = kCompSize[texcoord_type];
     if (tc_size > 0) {
         const std::uint32_t aligned = (off + tc_size - 1) / tc_size * tc_size;
         off = aligned + tc_size;
     }
-    // color
     const std::uint32_t col_size = kColorSize[color_type];
     if (col_size > 0) {
         const std::uint32_t aligned = (off + col_size - 1) / col_size * col_size;
         off = aligned + col_size;
     }
-    // normal
     const std::uint32_t norm_size = kCompSize[normal_type];
     if (norm_size > 0) {
+        const std::uint32_t num_normals = (normal_type == 3) ? 3 : 1;
         const std::uint32_t aligned = (off + norm_size - 1) / norm_size * norm_size;
-        off = aligned + norm_size * (normal_type == 3 ? 3 : 1);
+        off = aligned + norm_size * num_normals;
     }
-    // position
     const std::uint32_t pos_size = kCompSize[position_type];
     const std::uint32_t pos_offset = off;
-    // Read position
     const std::uint32_t addr = vertex_address + index * stride + pos_offset;
-    if (position_type == 2 && memory.contains(addr + 4, 4u)) {  // s16
+    if (position_type == 2 && memory.contains(addr + 4, 4u)) {
         x = static_cast<std::int16_t>(memory.aot_load16(addr));
         y = static_cast<std::int16_t>(memory.aot_load16(addr + 2));
         z = static_cast<std::int16_t>(memory.aot_load16(addr + 4));
-    } else if (position_type == 3 && memory.contains(addr + 12, 4u)) {  // f32
-        // skip f32 for now
     }
+}
+
+// Sample a CLUT4 texture. Returns 5551 pixel color.
+static std::uint32_t sample_clut4(const psprecomp::GuestMemory &memory,
+                                   std::uint32_t tex_addr, std::uint32_t tex_w, std::uint32_t tex_h,
+                                   std::uint32_t clut_addr, std::int16_t u, std::int16_t v) {
+    if (tex_w == 0 || tex_h == 0) return 0xFFFFFFFFu;
+    // Normalize u, v to [0, tex_w) x [0, tex_h)
+    std::int32_t tu = u;
+    std::int32_t tv = v;
+    // Handle wrapping (repeat mode assumed)
+    tu = ((tu % static_cast<std::int32_t>(tex_w)) + static_cast<std::int32_t>(tex_w)) % static_cast<std::int32_t>(tex_w);
+    tv = ((tv % static_cast<std::int32_t>(tex_h)) + static_cast<std::int32_t>(tex_h)) % static_cast<std::int32_t>(tex_h);
+    // CLUT4: 2 texels per byte
+    const std::uint32_t texel_index = static_cast<std::uint32_t>(tv) * tex_w + static_cast<std::uint32_t>(tu);
+    const std::uint32_t byte_addr = tex_addr + texel_index / 2u;
+    if (!memory.contains(byte_addr, 1u)) return 0u;
+    std::uint8_t byte = memory.aot_load8(byte_addr);
+    std::uint8_t idx = (texel_index & 1u) ? (byte >> 4) : (byte & 0x0F);
+    // CLUT lookup: 16 entries, each 16-bit (5551)
+    const std::uint32_t clut_entry_addr = clut_addr + idx * 2u;
+    if (!memory.contains(clut_entry_addr, 2u)) return 0u;
+    return memory.aot_load16(clut_entry_addr);
 }
 
 static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t start,
@@ -1979,7 +2021,18 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
     std::uint32_t offset_address = 0u;
     std::uint32_t vertex_address = 0u;
     std::uint32_t vertex_type = 0u;
+    std::uint32_t texture_address = 0u;
+    std::uint32_t texture_format = 0u;
+    std::uint32_t texture_size = 0u;
+    std::uint32_t texture_buffer_width = 0u;
+    std::uint32_t texture_mode = 0u;
+    std::uint32_t texture_function = 0u;
     std::uint32_t texture_enabled = 0u;
+    std::uint32_t clut_address = 0u;
+    std::uint32_t scissor_top_left = 0u;
+    std::uint32_t scissor_bottom_right = 0u;
+    std::uint32_t offset_x = 0u;
+    std::uint32_t offset_y = 0u;
     for (std::size_t step = 0u; step < 400000u; ++step) {
         if (!memory.contains(pc, 4u)) break;
         const std::uint32_t word = memory.aot_load32(pc);
@@ -1995,6 +2048,18 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
         if (command == 0x01u) { vertex_address = relative(data); continue; }
         if (command == 0x12u) { vertex_type = data; continue; }
         if (command == 0x1Eu) { texture_enabled = data & 1u; continue; }
+        if (command == 0xA0u) { texture_address = relative(data); continue; }
+        if (command == 0xB8u) { texture_size = data; continue; }
+        if (command == 0xA8u) { texture_buffer_width = data; continue; }
+        if (command == 0xC2u) { texture_mode = data; continue; }
+        if (command == 0xC3u) { texture_format = data; continue; }
+        if (command == 0xC9u) { texture_function = data; continue; }
+        if (command == 0xB0u) { clut_address = relative(data); continue; }
+        if (command == 0xB1u) { clut_address = (clut_address & 0x00FFFFFFu) | ((data & 0x0000000Fu) << 24u); continue; }
+        if (command == 0xD4u) { scissor_top_left = data; continue; }
+        if (command == 0xD5u) { scissor_bottom_right = data; continue; }
+        if (command == 0x4Cu) { offset_x = data; continue; }
+        if (command == 0x4Du) { offset_y = data; continue; }
         if (command == 0x04u) {  // PRIM
             const std::uint32_t count = data & 0xFFFFu;
             const std::uint32_t primitive = (data >> 16u) & 7u;
@@ -2006,7 +2071,6 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
             const std::uint32_t texcoord_type = vertex_type & 3u;
             static const std::uint32_t kCompSize[4] = {0, 1, 2, 4};
             static const std::uint32_t kColorSize[8] = {0, 0, 0, 0, 2, 2, 2, 4};
-            // Compute stride
             std::uint32_t off = 0;
             const std::uint32_t weight_type = (vertex_type >> 9) & 3u;
             const std::uint32_t weight_count = ((vertex_type >> 14) & 7u) + 1u;
@@ -2017,13 +2081,17 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
                 off += aligned;
             }
             const std::uint32_t tc_size = kCompSize[texcoord_type];
+            std::uint32_t tc_offset = 0;
             if (tc_size > 0) {
                 const std::uint32_t aligned = (off + tc_size - 1) / tc_size * tc_size;
+                tc_offset = aligned;
                 off = aligned + tc_size;
             }
             const std::uint32_t col_size = kColorSize[color_type];
+            std::uint32_t color_offset = 0;
             if (col_size > 0) {
                 const std::uint32_t aligned = (off + col_size - 1) / col_size * col_size;
+                color_offset = aligned;
                 off = aligned + col_size;
             }
             const std::uint32_t norm_size = kCompSize[normal_type];
@@ -2034,50 +2102,79 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
             }
             const std::uint32_t pos_size = kCompSize[position_type];
             const std::uint32_t pos_offset = off;
-            const std::uint32_t stride = (off + pos_size - 1) / (pos_size > 0 ? pos_size : 1) * (pos_size > 0 ? pos_size : 1);
-            const std::uint32_t final_stride = (stride + 3) & ~3u;  // align to 4
-            // Actually, stride is aligned to largest component. Let's use off + pos_size, aligned up.
             const std::uint32_t vertex_stride = ((off + pos_size + 3) / 4) * 4;
-            // Read color offset
-            std::uint32_t color_offset = 0;
-            {
-                std::uint32_t o = 0;
-                const std::uint32_t wt = (vertex_type >> 9) & 3u;
-                const std::uint32_t wc = ((vertex_type >> 14) & 7u) + 1u;
-                const std::uint32_t ws = kCompSize[wt];
-                if (ws > 0) { const std::uint32_t fs = wc * ws; o += ((fs + ws - 1) / ws) * ws; }
-                const std::uint32_t ts = kCompSize[texcoord_type];
-                if (ts > 0) { o = (o + ts - 1) / ts * ts + ts; }
-                const std::uint32_t cs = kColorSize[color_type];
-                if (cs > 0) { color_offset = (o + cs - 1) / cs * cs; }
+            // Texture dimensions from TEXSIZE0 (width-1, height-1) or buffer width
+            std::uint32_t tex_w = texture_buffer_width;
+            std::uint32_t tex_h = texture_buffer_width;
+            if (texture_size != 0u) {
+                tex_w = (texture_size & 0xFFFu) + 1u;
+                tex_h = ((texture_size >> 12u) & 0xFFFu) + 1u;
             }
             if (primitive == 6u) {  // Sprites: pairs of vertices
                 for (std::uint32_t i = 0u; i + 1 < count; i += 2) {
                     std::int16_t x0, y0, z0, x1, y1, z1;
                     decode_vertex_pos(memory, vertex_type, vertex_address, i, vertex_stride, x0, y0, z0);
                     decode_vertex_pos(memory, vertex_type, vertex_address, i + 1, vertex_stride, x1, y1, z1);
-                    // Read color from first vertex
+                    std::int16_t u0, v0, u1, v1;
+                    decode_vertex_tc(memory, vertex_type, vertex_address, i, vertex_stride, u0, v0);
+                    decode_vertex_tc(memory, vertex_type, vertex_address, i + 1, vertex_stride, u1, v1);
+                    // Read color
                     std::uint32_t color = 0xFFFFFFFFu;
                     if (color_type > 3 && memory.contains(vertex_address + i * vertex_stride + color_offset, 4u)) {
                         color = memory.aot_load32(vertex_address + i * vertex_stride + color_offset);
                     } else if (color_type > 3 && memory.contains(vertex_address + i * vertex_stride + color_offset, 2u)) {
                         color = memory.aot_load16(vertex_address + i * vertex_stride + color_offset);
                     }
-                    rasterize_sprite(memory, fb_base, width, height, x0, y0, x1, y1, color);
+                    const std::uint32_t x_lo = (x0 < x1) ? x0 : x1;
+                    const std::uint32_t x_hi = (x0 < x1) ? x1 : x0;
+                    const std::uint32_t y_lo = (y0 < y1) ? y0 : y1;
+                    const std::uint32_t y_hi = (y0 < y1) ? y1 : y0;
+                    // Render with texture if enabled and format 4 (Clut4)
+                    if (texture_enabled && texture_format == 4u && texture_address != 0u) {
+                        for (std::uint32_t y = y_lo; y < y_hi && y < height; ++y) {
+                            for (std::uint32_t x = x_lo; x < x_hi && x < width; ++x) {
+                                // Interpolate UV
+                                float fu = 0, fv = 0;
+                                if (x_hi > x_lo && y_hi > y_lo) {
+                                    float tx = static_cast<float>(x - x_lo) / static_cast<float>(x_hi - x_lo);
+                                    float ty = static_cast<float>(y - y_lo) / static_cast<float>(y_hi - y_lo);
+                                    fu = u0 + (u1 - u0) * tx;
+                                    fv = v0 + (v1 - v0) * ty;
+                                }
+                                std::uint32_t pixel = sample_clut4(memory, texture_address, tex_w, tex_h, clut_address,
+                                                                   static_cast<std::int16_t>(fu), static_cast<std::int16_t>(fv));
+                                if (pixel == 0xFFFFFFFFu) pixel = 0u;
+                                const std::uint32_t addr = fb_base + (y * width + x) * 2u;
+                                if (memory.contains(addr, 2u)) {
+                                    memory.store16(addr, static_cast<std::uint16_t>(pixel));
+                                }
+                            }
+                        }
+                    } else {
+                        // Solid color
+                        const std::uint16_t r = color & 0x1F;
+                        const std::uint16_t g = (color >> 5) & 0x1F;
+                        const std::uint16_t b = (color >> 10) & 0x1F;
+                        const std::uint16_t a = (color >> 15) & 0x1;
+                        const std::uint32_t px = (a << 15) | (b << 10) | (g << 5) | r;
+                        for (std::uint32_t y = y_lo; y < y_hi && y < height; ++y) {
+                            for (std::uint32_t x = x_lo; x < x_hi && x < width; ++x) {
+                                const std::uint32_t addr = fb_base + (y * width + x) * 2u;
+                                if (memory.contains(addr, 2u)) {
+                                    memory.store16(addr, static_cast<std::uint16_t>(px));
+                                }
+                            }
+                        }
+                    }
                 }
-            } else if (primitive == 3u) {  // Triangles
-                // Simple: just skip for now (need scanline fill)
             }
             continue;
         }
+        if (command == 0x0Eu) continue;
         if (command == 0x08u) { pc = relative(data) & 0x0FFFFFFCu; continue; }
-        if (command == 0x0Au) {
-            const std::uint32_t target = relative(data) & 0x0FFFFFFCu;
-            // For simplicity, don't follow CALLs in rasterizer
-            continue;
-        }
-        if (command == 0x0Bu) break;  // RET
-        if (command == 0x0Cu || command == 0x0Fu) break;  // END/FINISH
+        if (command == 0x0Au) continue;
+        if (command == 0x0Bu) break;
+        if (command == 0x0Cu || command == 0x0Fu) break;
     }
 }
 
