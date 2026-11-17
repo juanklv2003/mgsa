@@ -11,6 +11,8 @@
 #include "psprecomp/elf32.hpp"
 #include "psprecomp/interpreter.hpp"
 #include "psprecomp/runtime.hpp"
+#include "touch.hpp"
+#include "framebuffer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -244,6 +246,9 @@ struct HostInput {
 struct Host {
     Runtime *runtime{};
     HostInput input;
+    mgsa::TouchLayer touch;
+    bool touch_enabled{false};
+    std::string png_path;
     std::vector<Block> blocks;
     std::vector<FplPool> fpls;
     std::vector<IntrHandler> interrupts;
@@ -473,7 +478,7 @@ void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     wake_expired_delays();
     // A pulse, not a hold: the guest reads the buffer once per frame, and a button that never
     // goes up looks the same as one that was never pressed.
-    if (g_host.press_mask != 0u && g_host.vblank_count >= g_host.press_from) {
+    if (!g_host.touch_enabled && g_host.press_mask != 0u && g_host.vblank_count >= g_host.press_from) {
         g_host.input.buttons = (g_host.vblank_count & 2u) != 0u ? g_host.press_mask : 0u;
     }
     // Temporary: a sampled hash of guest RAM. A screen that never changes is either a frozen
@@ -3269,6 +3274,12 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             return;
         }
         runtime.memory().zero(data, 16u);
+        if (g_host.touch_enabled) {
+            const mgsa::InputState ts = g_host.touch.poll();
+            g_host.input.buttons = ts.buttons;
+            g_host.input.left_x = ts.left_x;
+            g_host.input.left_y = ts.left_y;
+        }
         runtime.memory().store32(data + 4u, g_host.input.buttons);
         // Temporary: prove the injected button reaches the guest, and prove the guest reads it.
         if (g_host.input.buttons != 0u && g_host.press_seen < 4u) {
@@ -3969,7 +3980,9 @@ bool on_unsupported(Runtime &runtime, AllegrexContext &, std::uint32_t pc, std::
 
 } // namespace
 
-int main(int argc, char **argv) {
+// mgsa_main is the platform-neutral entry: the desktop main() and the
+// Android NativeActivity both call it. CLI args select paths and max dispatches.
+int mgsa_main(int argc, char **argv) {
     std::filesystem::path elf_path = "extract/PSP_GAME/SYSDIR/BOOT.BIN";
     std::uint64_t max_dispatches = 20'000'000u;
     for (int i = 1; i < argc; ++i) {
@@ -3989,6 +4002,13 @@ int main(int argc, char **argv) {
             g_host.press_mask = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
         } else if (arg == "--press-from" && i + 1 < argc) {
             g_host.press_from = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
+        } else if (arg == "--png" && i + 1 < argc) {
+            g_host.png_path = argv[++i];
+        } else if (arg == "--touch-file" && i + 1 < argc) {
+            const std::string path = argv[++i];
+            const std::size_t n = g_host.touch.load_file(path);
+            g_host.touch_enabled = true;
+            std::cout << "[touch] loaded " << n << " events from " << path << "\n" << std::flush;
         }
     }
     if (g_host.game_root.empty()) g_host.game_root = "extract";
@@ -4305,6 +4325,18 @@ int main(int argc, char **argv) {
                 std::cout << "    " << hex32(sites[i].first) << "  " << sites[i].second << "\n";
             }
         }
+        // Optional frame dump: blit the guest's current EDRAM frame to RGBA PNG.
+        if (!g_host.png_path.empty() && g_host.runtime != nullptr) {
+            const auto &mem = g_host.runtime->memory();
+            const std::uint32_t fb = g_host.frame_buffer != 0u ? g_host.frame_buffer : 0x04000000u;
+            const std::uint32_t stride = g_host.frame_buffer_width != 0u ? g_host.frame_buffer_width : 512u;
+            const auto rgba = mgsa::blit_edram_rgba(mem, fb, stride,
+                                                   g_host.display_width, g_host.display_height);
+            const bool ok = mgsa::write_png(g_host.png_path, rgba.data(),
+                                           g_host.display_width, g_host.display_height);
+            std::cout << "[png] " << (ok ? "wrote " : "FAILED ") << g_host.png_path
+                      << " framebuffer=" << hex32(fb) << " stride=" << stride << "\n" << std::flush;
+        }
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "fatal: " << error.what() << "\n";
@@ -4314,3 +4346,46 @@ int main(int argc, char **argv) {
         return 1;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// C API for the Android NativeActivity (compiled with -DMGSA_ANDROID_LIBRARY).
+// The guest loop runs in mgsa_main; JNI pushes touch events into the same
+// TouchLayer the sceCtrl HLE drains, and reads the current EDRAM frame.
+// ---------------------------------------------------------------------------
+#ifdef MGSA_ANDROID_LIBRARY
+extern "C" {
+void mgsa_enable_touch() { g_host.touch_enabled = true; }
+
+void mgsa_touch_event(int kind, int id, float x, float y) {
+    mgsa::TouchEvent::Kind k = mgsa::TouchEvent::Down;
+    if (kind == 1) k = mgsa::TouchEvent::Move;
+    else if (kind == 2) k = mgsa::TouchEvent::Up;
+    g_host.touch.push({k, static_cast<std::uint32_t>(id), x, y});
+}
+
+std::uint32_t mgsa_touch_pending() { return static_cast<std::uint32_t>(g_host.touch.empty() ? 0u : 1u); }
+
+int mgsa_read_frame(std::uint8_t *dst, int dst_len) {
+    if (g_host.runtime == nullptr || dst == nullptr) return 0;
+    const int w = static_cast<int>(g_host.display_width);
+    const int h = static_cast<int>(g_host.display_height);
+    if (dst_len < w * h * 4) return 0;
+    const std::uint32_t fb = g_host.frame_buffer != 0u ? g_host.frame_buffer : 0x04000000u;
+    const std::uint32_t stride = g_host.frame_buffer_width != 0u ? g_host.frame_buffer_width : 512u;
+    const auto rgba = mgsa::blit_edram_rgba(g_host.runtime->memory(), fb, stride,
+                                            g_host.display_width, g_host.display_height);
+    std::copy(rgba.begin(), rgba.end(), dst);
+    return 1;
+}
+
+int mgsa_frame_width() { return static_cast<int>(g_host.display_width); }
+int mgsa_frame_height() { return static_cast<int>(g_host.display_height); }
+}
+#endif
+
+#ifndef MGSA_ANDROID_LIBRARY
+int main(int argc, char **argv) {
+    return mgsa_main(argc, argv);
+}
+#endif
