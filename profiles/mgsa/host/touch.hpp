@@ -63,7 +63,7 @@ public:
 
     // Produce the input state for the current poll. Call once per guest poll
     // (sceCtrlReadBufferPositive). Latches a press for at least one poll.
-    InputState poll();
+    InputState poll(std::uint32_t display_frame = 0u);
 
     // Parse a command file of down/move/up lines into the queue. Returns the
     // number of events parsed. Lines: "down <id> <x> <y>", "move <id> <x> <y>",

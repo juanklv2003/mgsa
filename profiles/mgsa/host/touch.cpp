@@ -12,15 +12,16 @@ void TouchLayer::push(const TouchEvent &event) {
     queue_.push_back(event);
 }
 
-InputState TouchLayer::poll() {
+InputState TouchLayer::poll(std::uint32_t display_frame) {
     ++frame_;
+    const std::uint32_t now = display_frame != 0u ? display_frame : frame_;
     InputState out;
 
     // Drain this frame's queued events.
     std::size_t budget = queue_.size();
     while (budget-- > 0 && !queue_.empty()) {
         TouchEvent e = queue_.front();
-        if (e.at_frame != 0u && e.at_frame > frame_) {
+        if (e.at_frame != 0u && e.at_frame > now) {
             queue_.push_back(e);
             continue;
         }

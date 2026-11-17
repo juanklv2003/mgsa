@@ -3275,7 +3275,7 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         }
         runtime.memory().zero(data, 16u);
         if (g_host.touch_enabled) {
-            const mgsa::InputState ts = g_host.touch.poll();
+            const mgsa::InputState ts = g_host.touch.poll(g_host.vblank_count);
             g_host.input.buttons = ts.buttons;
             g_host.input.left_x = ts.left_x;
             g_host.input.left_y = ts.left_y;
