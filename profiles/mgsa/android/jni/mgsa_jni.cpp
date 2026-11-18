@@ -38,6 +38,8 @@ struct App {
     std::atomic<bool> running{true};
     std::atomic<bool> guest_done{false};
     pthread_t guest_thread{};
+    pthread_t render_thread{};
+    std::atomic<ANativeWindow*> window{nullptr};  // acquired, kept alive across TERM_WINDOW
 };
 
 App g_app;
@@ -161,10 +163,13 @@ void *guest_main(void *) {
     return nullptr;
 }
 
-void render(android_app *app) {
-    if (app->window == nullptr) return;
-    const int w = ANativeWindow_getWidth(app->window);
-    const int h = ANativeWindow_getHeight(app->window);
+void render(ANativeWindow *window) {
+    static int rcount = 0;
+    if (++rcount <= 3 || rcount % 500 == 0)
+        __android_log_print(ANDROID_LOG_INFO, "MGSA", "render #%d called", rcount);
+    if (window == nullptr) return;
+    const int w = ANativeWindow_getWidth(window);
+    const int h = ANativeWindow_getHeight(window);
     if (w <= 0 || h <= 0) return;
 
     const int fw = mgsa_frame_width();
@@ -198,22 +203,54 @@ void render(android_app *app) {
     }
 
     ANativeWindow_Buffer buf;
-    if (ANativeWindow_lock(app->window, &buf, nullptr) != 0) return;
+    if (ANativeWindow_lock(window, &buf, nullptr) != 0) return;
     const int copy_w = fw < buf.width ? fw : buf.width;
     const int copy_h = fh < buf.height ? fh : buf.height;
+    static int lockshots = 0;
+    if (lockshots++ < 3)
+        __android_log_print(ANDROID_LOG_INFO, "MGSA", "lock ok w=%d h=%d fmt=%d stride=%d bits=%p copy=%dx%d",
+                            buf.width, buf.height, buf.format, buf.stride, buf.bits, copy_w, copy_h);
     if (buf.format == WINDOW_FORMAT_RGBA_8888) {
         for (int y = 0; y < copy_h; ++y) {
             std::uint8_t *dst = static_cast<std::uint8_t *>(buf.bits) + y * buf.stride * 4u;
             const std::uint8_t *src = frame.data() + static_cast<std::size_t>(y) * fw * 4u;
             std::memcpy(dst, src, static_cast<std::size_t>(copy_w) * 4u);
         }
+    } else if (buf.format == WINDOW_FORMAT_RGB_565) {
+        // Pixel 9a hands us an RGB565 surface. Convert each RGBA pixel to 5-6-5.
+        for (int y = 0; y < copy_h; ++y) {
+            std::uint16_t *dst = static_cast<std::uint16_t *>(buf.bits) + y * buf.stride;
+            const std::uint8_t *src = frame.data() + static_cast<std::size_t>(y) * fw * 4u;
+            for (int x = 0; x < copy_w; ++x) {
+                const std::uint8_t r = src[x*4+0], g = src[x*4+1], b = src[x*4+2];
+                dst[x] = static_cast<std::uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            }
+        }
     }
-    ANativeWindow_unlockAndPost(app->window);
+    ANativeWindow_unlockAndPost(window);
+}
+
+// Render thread: keeps drawing into an acquired window reference independently of
+// the main thread's command loop (which tore the window down within ~6 ms).
+void *render_thread_main(void *) {
+    __android_log_print(ANDROID_LOG_INFO, "MGSA", "render thread started");
+    while (g_app.running.load()) {
+        ANativeWindow *w = g_app.window.load();
+        if (w != nullptr) render(w);
+        usleep(16000);  // ~60 fps
+    }
+    return nullptr;
 }
 
 void on_cmd(android_app *app, int32_t cmd) {
+    __android_log_print(ANDROID_LOG_INFO, "MGSA", "on_cmd %d", cmd);
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
+            __android_log_print(ANDROID_LOG_INFO, "MGSA", "INIT_WINDOW: acquiring");
+            if (app->window != nullptr) {
+                ANativeWindow_acquire(app->window);
+                g_app.window.store(app->window);
+            }
             if (g_app.guest_thread == 0u) {
                 // The guest's interpreter recurses through unsupported-VFPU dispatch and
                 // emulates 32 MiB of guest RAM; the default ~1 MiB pthread stack overflows
@@ -225,9 +262,12 @@ void on_cmd(android_app *app, int32_t cmd) {
                 pthread_attr_destroy(&attr);
             }
             break;
-        case APP_CMD_TERM_WINDOW:
+        case APP_CMD_TERM_WINDOW: {
+            ANativeWindow *w = g_app.window.exchange(nullptr);
+            if (w != nullptr) ANativeWindow_release(w);
             g_app.running.store(false);
             break;
+        }
         default:
             break;
     }
@@ -240,18 +280,16 @@ void android_main(android_app *app) {
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
 
+    // Start a dedicated render thread that owns an acquired window reference.
+    pthread_create(&g_app.render_thread, nullptr, render_thread_main, nullptr);
+
     int events;
     android_poll_source *source;
     while (g_app.running.load()) {
-        const int timeout = (app->window != nullptr) ? 0 : -1;
-        while (ALooper_pollOnce(timeout, nullptr, &events, reinterpret_cast<void **>(&source)) >= 0) {
-            if (source != nullptr) source->process(app, source);
-            if (app->destroyRequested != 0) {
-                g_app.running.store(false);
-                break;
-            }
-        }
-        if (app->window != nullptr) render(app);
+        ALooper_pollOnce(-1, nullptr, &events, reinterpret_cast<void **>(&source));
+        if (source != nullptr) source->process(app, source);
+        if (app->destroyRequested != 0) g_app.running.store(false);
     }
     if (g_app.guest_thread != 0u) pthread_join(g_app.guest_thread, nullptr);
+    if (g_app.render_thread != 0u) pthread_join(g_app.render_thread, nullptr);
 }
