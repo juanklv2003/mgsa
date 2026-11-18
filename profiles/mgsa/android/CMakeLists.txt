@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(mgsa_android CXX)
+project(mgsa_android C CXX)
 
 # std::bit_cast and other C++20 facilities are used throughout the runtime.
 set(CMAKE_CXX_STANDARD 20)
@@ -55,10 +55,23 @@ target_compile_options(mgsa PRIVATE -O0)
 set_source_files_properties(${AOT_UNITS} PROPERTIES COMPILE_OPTIONS "-O0")
 
 # android_native_app_glue is source shipped with the NDK, not a prebuilt lib.
-set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c")
+# CMAKE_ANDROID_NDK is set by the Android toolchain file; fall back to ANDROID_NDK.
+set(_mgsa_ndk "${CMAKE_ANDROID_NDK}")
+if(NOT _mgsa_ndk)
+    set(_mgsa_ndk "$ENV{ANDROID_NDK}")
+endif()
+if(NOT _mgsa_ndk)
+    # Derive from the configured compiler path: <ndk>/toolchains/llvm/prebuilt/<host>/bin/clang++
+    get_filename_component(_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_prebuilt "${_bin}/../.." ABSOLUTE)
+    get_filename_component(_mgsa_ndk "${_prebuilt}/../../.." ABSOLUTE)
+endif()
+set(GLUE "${_mgsa_ndk}/sources/android/native_app_glue/android_native_app_glue.c")
 if(EXISTS "${GLUE}")
     target_sources(mgsa PRIVATE "${GLUE}")
-    target_include_directories(mgsa PRIVATE "${ANDROID_NDK}/sources/android/native_app_glue")
+    target_include_directories(mgsa PRIVATE "${_mgsa_ndk}/sources/android/native_app_glue")
+else()
+    message(FATAL_ERROR "android_native_app_glue.c not found at ${GLUE} (NDK='${_mgsa_ndk}')")
 endif()
 
 find_library(ANDROID_LOG log)

@@ -6,13 +6,18 @@
 #include <android/native_window.h>
 #include <android/input.h>
 #include <android/looper.h>
+#include <android/asset_manager.h>
+#include <android/log.h>
 #include <android_native_app_glue.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 // C API from main.cpp (compiled with -DMGSA_ANDROID_LIBRARY).
@@ -80,15 +85,68 @@ int32_t on_input(android_app *app, AInputEvent *event) {
     return 1;
 }
 
+// Copy an asset subtree to a real filesystem directory so the host's std::ifstream
+// paths work. Kept minimal: regular files only, directories created on demand.
+static void extract_assets(AAssetManager *mgr, const char *asset_dir, const std::string &out_dir) {
+    AAssetDir *dir = AAssetManager_openDir(mgr, asset_dir);
+    if (dir == nullptr) {
+        __android_log_print(ANDROID_LOG_WARN, "MGSA", "no asset dir %s", asset_dir);
+        return;
+    }
+    const char *name;
+    while ((name = AAssetDir_getNextFileName(dir)) != nullptr) {
+        std::string rel = std::string(asset_dir) + "/" + name;
+        std::string dst = out_dir + "/" + name;
+        AAsset *a = AAssetManager_open(mgr, rel.c_str(), AASSET_MODE_STREAMING);
+        if (a != nullptr) {
+            // A directory in assets appears as a zero-length asset with no content we can
+            // distinguish reliably; try to open it as a directory first.
+            AAssetDir *sub = AAssetManager_openDir(mgr, rel.c_str());
+            if (sub != nullptr) {
+                AAssetDir_close(sub);
+                mkdir(dst.c_str(), 0777);
+                extract_assets(mgr, rel.c_str(), dst);
+            } else {
+                mkdir(out_dir.c_str(), 0777);
+                std::ofstream f(dst, std::ios::binary);
+                char buf[16384];
+                int n;
+                while ((n = AAsset_read(a, buf, sizeof(buf))) > 0) f.write(buf, n);
+                f.close();
+            }
+            AAsset_close(a);
+        } else {
+            mkdir(dst.c_str(), 0777);
+            extract_assets(mgr, rel.c_str(), dst);
+        }
+    }
+    AAssetDir_close(dir);
+}
+
 void *guest_main(void *) {
+    __android_log_print(ANDROID_LOG_INFO, "MGSA", "guest_main: starting");
     mgsa_enable_touch();
+    // Unpack the bundled game tree from assets to the app's files dir once.
+    const std::string files = "/data/data/io.github.juanklv2003.mgsa/files";
+    const std::string marker = files + "/extract/PSP_GAME/SYSDIR/BOOT.BIN";
+    struct stat st{};
+    if (stat(marker.c_str(), &st) != 0) {
+        __android_log_print(ANDROID_LOG_INFO, "MGSA", "extracting assets to %s", files.c_str());
+        extract_assets(g_app.app->activity->assetManager, "extract", files);
+        __android_log_print(ANDROID_LOG_INFO, "MGSA", "asset extraction done");
+    } else {
+        __android_log_print(ANDROID_LOG_INFO, "MGSA", "game data already present");
+    }
     // The disc image is installed in the app's files dir by the launcher.
     // Paths are passed to mgsa_main like the desktop CLI.
     char arg0[] = "mgsa";
     char arg1[] = "--root";
     char arg2[] = "/data/data/io.github.juanklv2003.mgsa/files/extract";
-    char *argv[] = {arg0, arg1, arg2};
-    mgsa_main_android(3, argv);
+    char arg3[] = "--elf";
+    char arg4[] = "/data/data/io.github.juanklv2003.mgsa/files/extract/PSP_GAME/SYSDIR/BOOT.BIN";
+    char *argv[] = {arg0, arg1, arg2, arg3, arg4};
+    mgsa_main_android(5, argv);
+    __android_log_print(ANDROID_LOG_INFO, "MGSA", "guest_main: mgsa_main returned");
     g_app.guest_done.store(true);
     return nullptr;
 }

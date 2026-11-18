@@ -8,6 +8,8 @@
 
     <application
         android:label="Metal Gear AC!D"
+        android:icon="@mipmap/ic_launcher"
+        android:debuggable="true"
         android:hasCode="true"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
         <activity
@@ -15,6 +17,7 @@
             android:exported="true"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            <meta-data android:name="android.app.lib_name" android:value="mgsa" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
