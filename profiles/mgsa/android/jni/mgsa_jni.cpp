@@ -93,38 +93,45 @@ static void extract_assets(AAssetManager *mgr, const char *asset_dir, const std:
         __android_log_print(ANDROID_LOG_WARN, "MGSA", "no asset dir %s", asset_dir);
         return;
     }
+    mkdir(out_dir.c_str(), 0777);
+    int copied = 0;
     const char *name;
     while ((name = AAssetDir_getNextFileName(dir)) != nullptr) {
         std::string rel = std::string(asset_dir) + "/" + name;
         std::string dst = out_dir + "/" + name;
-        AAsset *a = AAssetManager_open(mgr, rel.c_str(), AASSET_MODE_STREAMING);
-        if (a != nullptr) {
-            // A directory in assets appears as a zero-length asset with no content we can
-            // distinguish reliably; try to open it as a directory first.
-            AAssetDir *sub = AAssetManager_openDir(mgr, rel.c_str());
-            if (sub != nullptr) {
-                AAssetDir_close(sub);
-                mkdir(dst.c_str(), 0777);
-                extract_assets(mgr, rel.c_str(), dst);
-            } else {
-                mkdir(out_dir.c_str(), 0777);
+        // A subdirectory has at least one entry. Try opening as a dir first.
+        AAssetDir *sub = AAssetManager_openDir(mgr, rel.c_str());
+        bool is_dir = false;
+        if (sub != nullptr) {
+            const char *first = AAssetDir_getNextFileName(sub);
+            is_dir = (first != nullptr);
+            AAssetDir_close(sub);
+        }
+        if (is_dir) {
+            extract_assets(mgr, rel.c_str(), dst);
+        } else {
+            AAsset *a = AAssetManager_open(mgr, rel.c_str(), AASSET_MODE_STREAMING);
+            if (a != nullptr) {
                 std::ofstream f(dst, std::ios::binary);
                 char buf[16384];
                 int n;
                 while ((n = AAsset_read(a, buf, sizeof(buf))) > 0) f.write(buf, n);
                 f.close();
+                AAsset_close(a);
+                ++copied;
             }
-            AAsset_close(a);
-        } else {
-            mkdir(dst.c_str(), 0777);
-            extract_assets(mgr, rel.c_str(), dst);
         }
     }
     AAssetDir_close(dir);
+    __android_log_print(ANDROID_LOG_INFO, "MGSA", "extracted %d files from %s", copied, asset_dir);
 }
 
 void *guest_main(void *) {
     __android_log_print(ANDROID_LOG_INFO, "MGSA", "guest_main: starting");
+    // Redirect the host's stdout/stderr to a log file we can read with run-as.
+    const char *logpath = "/data/data/io.github.juanklv2003.mgsa/files/guest.log";
+    freopen(logpath, "w", stdout);
+    freopen(logpath, "a", stderr);
     mgsa_enable_touch();
     // Unpack the bundled game tree from assets to the app's files dir once.
     const std::string files = "/data/data/io.github.juanklv2003.mgsa/files";
@@ -144,8 +151,10 @@ void *guest_main(void *) {
     char arg2[] = "/data/data/io.github.juanklv2003.mgsa/files/extract";
     char arg3[] = "--elf";
     char arg4[] = "/data/data/io.github.juanklv2003.mgsa/files/extract/PSP_GAME/SYSDIR/BOOT.BIN";
-    char *argv[] = {arg0, arg1, arg2, arg3, arg4};
-    mgsa_main_android(5, argv);
+    char arg5[] = "--iso";
+    char arg6[] = "/data/data/io.github.juanklv2003.mgsa/files/mgsa.iso";
+    char *argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6};
+    mgsa_main_android(7, argv);
     __android_log_print(ANDROID_LOG_INFO, "MGSA", "guest_main: mgsa_main returned");
     g_app.guest_done.store(true);
     return nullptr;
