@@ -4267,13 +4267,7 @@ int mgsa_main(int argc, char **argv) {
         std::cout << "--- running from entry " << hex32(entry) << " (max " << max_dispatches << " dispatches)\n"
                   << std::flush;
         const auto started = std::chrono::steady_clock::now();
-        try {
-            runtime.run(entry, max_dispatches);
-        } catch (const std::exception &e) {
-            std::cout << "--- EXCEPTION: " << e.what() << "\n" << std::flush;
-        } catch (...) {
-            std::cout << "--- UNKNOWN EXCEPTION\n" << std::flush;
-        }
+        runtime.run(entry, max_dispatches);
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         std::cout << "--- run stopped after " << g_host.dispatches << " dispatches in " << elapsed_ms << " ms\n";
