@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -171,6 +172,30 @@ void render(android_app *app) {
     if (fw <= 0 || fh <= 0) return;
     std::vector<std::uint8_t> frame(static_cast<std::size_t>(fw) * fh * 4u);
     if (mgsa_read_frame(frame.data(), static_cast<int>(frame.size())) == 0) return;
+
+    // The guest's clear sprite has alpha=0, so a straight copy composites as black
+    // on Android. Force opaque so whatever the guest draws is actually visible.
+    bool has_visible = false;
+    for (std::size_t i = 3; i < frame.size(); i += 4u) {
+        if (frame[i] != 0u || frame[i-3] != 0u || frame[i-2] != 0u || frame[i-1] != 0u) {
+            has_visible = true;
+        }
+        frame[i] = 0xFFu;
+    }
+    if (!has_visible) {
+        // Diagnostic fallback: the guest produced only a transparent clear. Paint a
+        // visible gradient + cross so the screen is not dead and touch can be tested.
+        for (int y = 0; y < fh; ++y) {
+            for (int x = 0; x < fw; ++x) {
+                const std::size_t o = (static_cast<std::size_t>(y) * fw + x) * 4u;
+                const bool cross = (std::abs(x - fw/2) < 3) || (std::abs(y - fh/2) < 3);
+                frame[o+0] = cross ? 0xFFu : static_cast<std::uint8_t>(x * 255 / fw);
+                frame[o+1] = cross ? 0xFFu : static_cast<std::uint8_t>(y * 255 / fh);
+                frame[o+2] = cross ? 0x40u : 0x60u;
+                frame[o+3] = 0xFFu;
+            }
+        }
+    }
 
     ANativeWindow_Buffer buf;
     if (ANativeWindow_lock(app->window, &buf, nullptr) != 0) return;
