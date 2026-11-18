@@ -190,7 +190,14 @@ void on_cmd(android_app *app, int32_t cmd) {
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
             if (g_app.guest_thread == 0u) {
-                pthread_create(&g_app.guest_thread, nullptr, guest_main, nullptr);
+                // The guest's interpreter recurses through unsupported-VFPU dispatch and
+                // emulates 32 MiB of guest RAM; the default ~1 MiB pthread stack overflows
+                // on ARM64. Give it room comparable to the desktop main thread.
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setstacksize(&attr, 16u * 1024u * 1024u);
+                pthread_create(&g_app.guest_thread, &attr, guest_main, nullptr);
+                pthread_attr_destroy(&attr);
             }
             break;
         case APP_CMD_TERM_WINDOW:
