@@ -39,7 +39,20 @@ go straight into the game's single input seam (`sceCtrlReadBufferPositive`).
 
 Raw PSP button bits are preserved; the game does its own L/R relocation.
 
+## Build scripts (this machine)
+
+`work/build_android_full.ps1` (downloads/extracts toolchain, configures CMake,
+builds `libmgsa.so`) and `work/package_apk.ps1` (Java -> dex -> aapt2 -> zipalign
+-> apksigner) automate the pipeline. The NDK (`android-ndk-r27c`) and SDK
+(command-line tools + platform 34 + build-tools 34.0.0) are under `work/`
+(gitignored). Output: `mgsa.apk` (signed, arm64-v8a, includes `PSP_GAME` assets).
+
 ## Status
+
+The native arm64 APK builds and is signed: `libmgsa.so` is an ELF64/AArch64
+shared object containing the AOT corpus, runtime, guest loop, touch layer and
+EDRAM->RGBA blit, driven by a NativeActivity with no SDL. The desktop baseline
+is verified (516 frames / 8712 ms guest time).
 
 The input seam, gesture recognizer, external event queue, EDRAM->RGBA blit and
 frame dump are implemented and tested on desktop. The stage transition that
