@@ -29,6 +29,13 @@ go straight into the game's single input seam (`sceCtrlReadBufferPositive`).
 4. Sign with `apksigner` and install; place the disc image under the app's
    files dir if not bundled.
 
+**Android 15+ / 16 kB pages:** the CMake build sets
+`ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON` so the `.so` LOAD segments align to
+0x4000. When packaging, `zipalign` MUST use `-p 16384` (not `-p 4`) so the
+library is page-aligned inside the APK. Otherwise the loader rejects it with
+"not compatible with 16 kB mode / failed to load segment LOAD" (seen on
+Pixel 9a / Android 17).
+
 ## Touch gestures (docs/03-input-seam.md, docs/04-ui-intent.md)
 
 - Tap a card -> CROSS (confirm), held for >=1 poll frame.
