@@ -4140,9 +4140,6 @@ int mgsa_main(int argc, char **argv) {
     if (const char *env = std::getenv("MGSA_IMPOSE_RET")) {
         g_host.impose_ret = static_cast<std::uint32_t>(std::stoul(env, nullptr, 0));
     }
-    if (const char *env = std::getenv("MGSA_IMPOSE_RET")) {
-        g_host.impose_ret = static_cast<std::uint32_t>(std::stoul(env, nullptr, 0));
-    }
 
     // The extracted tree came from an ISO on this machine. Finding it makes the raw-sector device
     // real instead of a lie; if it is not there, that open fails with NOENT and the log says why.
