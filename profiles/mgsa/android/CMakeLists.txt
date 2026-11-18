@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.22)
 project(mgsa_android C CXX)
 
+# Android 15+ (and the Pixel 9a / Android 17 here) requires 16 kB page-size
+# ELF segments. NDK r27 supports flexible page sizes; without this the loader
+# rejects the library with "failed to load segment LOAD" / 16 kB mode error.
+set(ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES ON)
 # std::bit_cast and other C++20 facilities are used throughout the runtime.
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
