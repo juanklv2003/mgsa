@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
 project(mgsa_android CXX)
 
+# std::bit_cast and other C++20 facilities are used throughout the runtime.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 # Build with the Android NDK toolchain:
 #   cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
 #         -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
@@ -44,8 +49,9 @@ target_include_directories(mgsa PRIVATE
 )
 
 target_compile_definitions(mgsa PRIVATE MGSA_ANDROID_LIBRARY)
-# The corpus is large; -O0 matches the desktop bring-up build.
-target_compile_options(mgsa PRIVATE -O0 -fno-exceptions -fno-rtti)
+# The corpus is large; -O0 matches the desktop bring-up build. The host uses
+# C++ exceptions for error handling, so keep them enabled.
+target_compile_options(mgsa PRIVATE -O0)
 set_source_files_properties(${AOT_UNITS} PROPERTIES COMPILE_OPTIONS "-O0")
 
 # android_native_app_glue is source shipped with the NDK, not a prebuilt lib.

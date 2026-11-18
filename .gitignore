@@ -13,3 +13,9 @@ profile/**/generated/
 
 # Local agent tooling state: machine-specific absolute paths
 /.atl/
+
+*.apk
+
+build-android/
+*.apk.idsig
+profiles/mgsa/android/build/

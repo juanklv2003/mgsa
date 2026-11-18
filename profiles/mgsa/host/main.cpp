@@ -4512,6 +4512,9 @@ int mgsa_read_frame(std::uint8_t *dst, int dst_len) {
 
 int mgsa_frame_width() { return static_cast<int>(g_host.display_width); }
 int mgsa_frame_height() { return static_cast<int>(g_host.display_height); }
+
+// C-linkage entry for the Android NativeActivity (mgsa_main itself is C++).
+int mgsa_main_android(int argc, char **argv) { return mgsa_main(argc, argv); }
 }
 #endif
 

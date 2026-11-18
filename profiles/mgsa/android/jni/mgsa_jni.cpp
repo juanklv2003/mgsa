@@ -6,6 +6,7 @@
 #include <android/native_window.h>
 #include <android/input.h>
 #include <android/looper.h>
+#include <android_native_app_glue.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -21,7 +22,7 @@ void mgsa_touch_event(int kind, int id, float x, float y);
 int  mgsa_read_frame(std::uint8_t *dst, int dst_len);
 int  mgsa_frame_width();
 int  mgsa_frame_height();
-int  mgsa_main(int argc, char **argv);
+int  mgsa_main_android(int argc, char **argv);
 }
 
 namespace {
@@ -87,7 +88,7 @@ void *guest_main(void *) {
     char arg1[] = "--root";
     char arg2[] = "/data/data/io.github.juanklv2003.mgsa/files/extract";
     char *argv[] = {arg0, arg1, arg2};
-    mgsa_main(3, argv);
+    mgsa_main_android(3, argv);
     g_app.guest_done.store(true);
     return nullptr;
 }
@@ -108,7 +109,7 @@ void render(android_app *app) {
     if (ANativeWindow_lock(app->window, &buf, nullptr) != 0) return;
     const int copy_w = fw < buf.width ? fw : buf.width;
     const int copy_h = fh < buf.height ? fh : buf.height;
-    if (buf.format == AWINDOW_FORMAT_RGBA_8888) {
+    if (buf.format == WINDOW_FORMAT_RGBA_8888) {
         for (int y = 0; y < copy_h; ++y) {
             std::uint8_t *dst = static_cast<std::uint8_t *>(buf.bits) + y * buf.stride * 4u;
             const std::uint8_t *src = frame.data() + static_cast<std::size_t>(y) * fw * 4u;
@@ -136,7 +137,6 @@ void on_cmd(android_app *app, int32_t cmd) {
 }  // namespace
 
 void android_main(android_app *app) {
-    app_dummy();
     g_app.app = app;
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
@@ -145,7 +145,7 @@ void android_main(android_app *app) {
     android_poll_source *source;
     while (g_app.running.load()) {
         const int timeout = (app->window != nullptr) ? 0 : -1;
-        while (ALooper_pollAll(timeout, nullptr, &events, reinterpret_cast<void **>(&source)) >= 0) {
+        while (ALooper_pollOnce(timeout, nullptr, &events, reinterpret_cast<void **>(&source)) >= 0) {
             if (source != nullptr) source->process(app, source);
             if (app->destroyRequested != 0) {
                 g_app.running.store(false);
