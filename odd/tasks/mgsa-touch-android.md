@@ -27,14 +27,16 @@ S6. Rasterizer output. Reuse the committed software rasterizer (`rasterize_ge_li
 
 ## Tasks
 
-T1 S1-S4: touch input layer (`profiles/mgsa/host/touch.hpp/.cpp`). DONE — bb5d399. Gesture recognizer (tap=CROSS, swipe=directional, drag=analog, two-finger=CIRCLE) + down/move/up command-file queue.
-T2 S1-S4: wire into `sceCtrlReadBufferPositive`, `--touch-file` CLI, press latch. DONE — bb5d399. Verified: `[press] frame N buttons=0x4020` reaches guest.
-T3 S6: EDRAM->RGBA blit + PNG writer + `--png`. DONE — bb5d399. Verified: valid 480x272 RGBA PNG.
-T4 S5: Android NDK CMake + NativeActivity + JNI bridge + build_apk.sh. DONE — 8aa3c40. Not compiled here: no Android SDK/NDK installed on this machine; structure is reproducible per android/README.md.
-T5 S1-S6: end-to-end verification + docs. PARTIAL — desktop verified; Android build pending NDK install. Blocked on external toolchain, not on code.
+T1 S1-S4: touch input layer (`profiles/mgsa/host/touch.hpp/.cpp`). DONE ï¿½ bb5d399. Gesture recognizer (tap=CROSS, swipe=directional, drag=analog, two-finger=CIRCLE) + down/move/up command-file queue.
+T2 S1-S4: wire into `sceCtrlReadBufferPositive`, `--touch-file` CLI, press latch. DONE ï¿½ bb5d399. Verified: `[press] frame N buttons=0x4020` reaches guest.
+T3 S6: EDRAM->RGBA blit + PNG writer + `--png`. DONE ï¿½ bb5d399. Verified: valid 480x272 RGBA PNG.
+T4 S5: Android NDK CMake + NativeActivity + JNI bridge + build_apk.sh. DONE ï¿½ 8aa3c40. Not compiled here: no Android SDK/NDK installed on this machine; structure is reproducible per android/README.md.
+T5 S1-S6: end-to-end verification + docs. PARTIAL ï¿½ desktop verified; Android build pending NDK install. Blocked on external toolchain, not on code.
 
 ## Log
 
 L1 (original request): "Reverse-engineer Metal Gear AC!D so it runs natively on Android with a real touch interface instead of emulated PSP buttons. Touch-native gameplay: no d-pad, no L/R, no 'press X' â€” tap a card to select, drag/pinch to pan and zoom the board."
 
 L2 (2026-11-17): Pivoted from BOOT.BIN stage-transition RE (diminishing returns, multiple falsified hypotheses) to this touch+Android feature. T1-T4 implemented and pushed. Desktop gesture test and PNG dump verified. Android APK not built here (no SDK/NDK); build scaffolding is complete and documented.
+
+L3 (2026-11-18): Continued RE of the title-stage gate. Root cause narrowed: `mgp_stage`'s `mount_stage` calls `sceImpose::0x36AA6E91`, whose stub returned 0; mount_stage treats 0 as "failed" (`v1 = v0 - 1; if (v1 >= 5) goto fail`) and sets the stage state to 0, so the engine never advances past the title mount. Implemented an honest-ish HLE: `sceImpose::0x36AA6E91` now returns `MGSA_IMPOSE_RET` (default 0) instead of always 0, with the value configurable at runtime. Tested 0..5: mount_stage's success path (1..5) does not unblock the title load either, so the gate is not solely this stub â€” the engine still opens `title/_zar` (fd 318) and never reads it. Next: identify which condition the engine (AOT `Main`, 0x0880447C) checks after mount_stage returns, and whether a different HLE return or an unread `_zar` precondition is the real blocker. Desktop verification unchanged: 516 frames, empty screen, zero I/O after frame 36.

@@ -257,6 +257,7 @@ struct Host {
     std::vector<IntrHandler> queued_interrupts;
     bool interrupt_chain_active{};
     std::uint32_t vblank_count{};
+    std::uint32_t impose_ret{};
     // The virtual time at which the next frame boundary arrives. A wait for the display parks on
     // this instant, so every thread that asks for a frame inside one period resumes on the same
     // boundary and the clock advances one frame period per boundary, not one per caller.
@@ -272,6 +273,14 @@ struct Host {
     std::uint32_t display_height{272u};
     std::uint32_t press_mask{};
     std::uint32_t press_from{300u};
+    std::uint32_t pchist_low{};
+    std::uint32_t pchist_high{};
+    // sceUtility savedata is a four-call protocol whose only observable output is a status the
+    // caller polls. Keeping the state here is the difference between a dialog that completes and
+    // a caller that polls "not started" forever.
+    std::uint32_t savedata_param{};
+    int savedata_status{};
+    std::uint64_t savedata_status_polls{};
     std::uint32_t press_seen{};
     std::unordered_map<std::uint32_t, std::uint64_t> vblank_callers;
     std::uint64_t last_ram_hash{};
@@ -987,17 +996,25 @@ void install_stub(Runtime &runtime, const psprecomp::PspImport &import) {
     g_host.bound_imports.insert(import.library + ":" + hex32(import.nid));
     auto state = std::make_shared<StubState>();
     state->label = import.library + "::" + runtime.nids().resolve(import.library, import.nid).value_or(hex32(import.nid));
-    runtime.register_hle(import.library, import.nid, [state](Runtime &, AllegrexContext &ctx) {
+    runtime.register_hle(import.library, import.nid, [state, library = import.library, nid = import.nid](Runtime &, AllegrexContext &ctx) {
         if (state->calls++ == 0u) {
             std::cout << "[stub]  " << state->label << "  a0=" << hex32(ctx.gpr[4]) << " a1=" << hex32(ctx.gpr[5])
                       << " a2=" << hex32(ctx.gpr[6]) << " a3=" << hex32(ctx.gpr[7]) << " ra=" << hex32(ctx.gpr[31])
                       << "\n"
                       << std::flush;
         }
-        ctx.gpr[2] = 0u;
+        // sceImpose::0x36AA6E91 (called by mgp_stage's mount_stage) returns a status index in 1..5;
+        // 0 means "no status / fail" and makes mount_stage take its fail path. The default 0 keeps
+        // the original behaviour; set MGSA_IMPOSE_RET=1..5 to test a success path.
+        if (library == "sceImpose" && nid == 0x36AA6E91u) {
+            ctx.gpr[2] = g_host.impose_ret;
+        } else {
+            ctx.gpr[2] = 0u;
+        }
     });
 }
 
+// A stub answers success for every argument, so a caller that branches on the result believes the
 // ---------------------------------------------------------------------------
 // Secondary PRX modules
 // ---------------------------------------------------------------------------
@@ -1170,6 +1187,24 @@ std::size_t load_prx_module_impl(Runtime &runtime, psprecomp::Elf32Image image, 
             std::cout << "[module]   relocated 0x003C: " << hex32(runtime.memory().aot_load32(module.base + 0x3Cu)) << "\n" << std::flush;
             std::cout << "[module]   relocated 0x0044: " << hex32(runtime.memory().aot_load32(module.base + 0x44u)) << "\n" << std::flush;
             std::cout << "[module]   relocated 0x004C: " << hex32(runtime.memory().aot_load32(module.base + 0x4Cu)) << "\n" << std::flush;
+            for (std::uint32_t offset = 0x22ACu; offset < 0x23C0u; offset += 4u) {
+                std::cout << "[module]   word +" << hex32(offset) << " = "
+                          << hex32(runtime.memory().aot_load32(module.base + offset)) << "\n";
+            }
+            for (std::uint32_t offset = 0x32ACu; offset < 0x3374u; offset += 4u) {
+                std::cout << "[module]   word +" << hex32(offset) << " = "
+                          << hex32(runtime.memory().aot_load32(module.base + offset)) << "\n";
+            }
+            for (std::uint32_t probe : {0x75EF0u, 0x75F28u, 0x75FF4u, 0xF7B1Cu, 0xF7F44u, 0xF7F58u}) {
+                std::cout << "[module]   probe " << hex32(probe)
+                          << " contains=" << (runtime.memory().contains(probe, 4u) ? 1 : 0)
+                          << " function=" << (runtime.has_function(probe) ? 1 : 0);
+                if (runtime.memory().contains(probe, 4u)) {
+                    std::cout << " word=" << hex32(runtime.memory().load32(probe));
+                }
+                std::cout << "\n";
+            }
+            std::cout << std::flush;
         }
     // Temporary: an export is the only way to name what a module does when the guest calls it by
     // NID. Printing the table turns a `jal` into module code into a named function.
@@ -1552,6 +1587,33 @@ void module_return_sentinel(Runtime &runtime, AllegrexContext &ctx) {
             if (shown < 20) {
                 ++shown;
                 std::cout << "[kjfs] open -> " << hex32(result) << "\n" << std::flush;
+            }
+        }
+        // The stage mount is the gate between stages: everything after it depends on whether the
+        // engine was told the archive is usable. Report the value it actually returned.
+        if (frame.nid == 0x813E06ADu || frame.nid == 0xCD04902Eu) {
+            GuestThread *self = current_thread();
+            std::cout << "[kjfs] export " << hex32(frame.nid) << " -> " << hex32(result)
+                      << " frame=" << g_host.vblank_count
+                      << " by='" << (self == nullptr ? "?" : self->name) << "'\n" << std::flush;
+        }
+        // The stage module is a library: the engine calls its exports every frame and acts on
+        // what they return. A stage that never advances is either reporting a state the engine
+        // ignores or never being asked.
+        if (frame.nid == 0xD632ACDBu || frame.nid == 0xCEE8593Cu || frame.nid == 0xF01D73A7u) {
+            if (g_host.vblank_count >= 30u && g_host.vblank_count <= 80u) {
+                std::cout << "[stage] frame=" << g_host.vblank_count << " export " << hex32(frame.nid)
+                          << " -> " << hex32(result);
+                for (const auto &module : g_host.modules) {
+                    if (module.name != "mgp_stage") continue;
+                    if (!runtime.memory().contains(module.base + 0x4A5Cu, 4u)) continue;
+                    const std::uint32_t holder = runtime.memory().load32(module.base + 0x4A5Cu);
+                    std::cout << " state_word=" << hex32(holder);
+                    if (holder != 0u && runtime.memory().contains(holder + 4u, 2u)) {
+                        std::cout << " state=" << runtime.memory().load16(holder + 4u);
+                    }
+                }
+                std::cout << "\n" << std::flush;
             }
         }
         // Temporary: how the sound library answers the call that just returned, so a request
@@ -2318,6 +2380,7 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         thread->context.gpr[31] = kThreadExitStub;
         make_ready(*thread);
         std::cout << "[thread] start uid=" << thread->uid << " '" << thread->name << "' frame=" << g_host.vblank_count
+                  << " ra=" << hex32(ctx.gpr[31]) << " prev=" << static_cast<int>(thread->state)
                   << "\n"
                   << std::flush;
         ctx.gpr[2] = 0u;
@@ -2553,6 +2616,9 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         sema.name = read_guest_string(runtime, ctx.gpr[4], 32u);
         sema.initial_count = sema.count;
         sema.creator = current_thread() == nullptr ? std::string("?") : current_thread()->name;
+        std::cout << "[semacreate] frame=" << g_host.vblank_count << " uid=" << sema.uid << " '"
+                  << sema.name << "' count=" << sema.count << " max=" << sema.maximum
+                  << " by='" << sema.creator << "'\n" << std::flush;
         g_host.semas.push_back(sema);
         ctx.gpr[2] = sema.uid;
     });
@@ -2631,7 +2697,14 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             if (sema.uid != uid) continue;
             const std::int32_t add = static_cast<std::int32_t>(std::max<std::uint32_t>(ctx.gpr[5], 1u));
             ++sema.signals;
+            const std::int32_t before = sema.count;
             sema.count = std::min(sema.maximum, sema.count + add);
+            if (g_host.vblank_count <= 120u && sema.name != "SDLIB_SM") {
+                GuestThread *self = current_thread();
+                std::cout << "[semasig] frame=" << g_host.vblank_count << " sema=" << sema.uid << " '"
+                          << sema.name << "' " << before << "->" << sema.count
+                          << " by='" << (self == nullptr ? "?" : self->name) << "'\n" << std::flush;
+            }
             wake_sema_waiters(sema);
             ctx.gpr[2] = 0u;
             return;
@@ -3578,6 +3651,49 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             ctx.gpr[2] = 0u;
         });
 
+    // --- sceUtility savedata. The stage modules drive the save dialog through init/status/
+    // update/shutdown and act only on the status value. A stub that answers 0
+    // (SCE_UTILITY_STATUS_NONE) leaves the caller polling "not started" forever, which looks
+    // exactly like a frozen guest: no file I/O, no scene, one thread running.
+    bind("sceUtility", 0x50C4CD57u, "sceUtilitySavedataInitStart", [](Runtime &runtime, AllegrexContext &ctx) {
+        const std::uint32_t param = ctx.gpr[4];
+        if (param == 0u || !runtime.memory().contains(param, 4u)) {
+            std::cout << "[savedata] InitStart rejected param=" << hex32(param) << "\n" << std::flush;
+            ctx.gpr[2] = 0x80110305u;  // SCE_UTILITY_SAVEDATA_ERROR_PARAM
+            return;
+        }
+        g_host.savedata_param = param;
+        // SCE_UTILITY_STATUS_FINISHED (3) completes the dialog in one step. Until the host can
+        // back the operation with real storage, the alternative is reporting a result the guest
+        // would act on, so this stays behind a switch while the protocol is being confirmed.
+        const bool finish_immediately = std::getenv("MGSA_SAVEDATA_FINISHED") != nullptr;
+        g_host.savedata_status = finish_immediately ? 3 : 0;
+        std::cout << "[savedata] InitStart frame=" << g_host.vblank_count << " param=" << hex32(param)
+                  << " size=" << runtime.memory().load32(param) << " -> status=" << g_host.savedata_status
+                  << "\n" << std::flush;
+        ctx.gpr[2] = 0u;
+    });
+    bind("sceUtility", 0x8874DBE0u, "sceUtilitySavedataGetStatus", [](Runtime &, AllegrexContext &ctx) {
+        const std::uint64_t poll = ++g_host.savedata_status_polls;
+        if (poll <= 5u || poll % 600u == 0u) {
+            std::cout << "[savedata] GetStatus -> " << g_host.savedata_status << " poll=" << poll
+                      << " frame=" << g_host.vblank_count << "\n" << std::flush;
+        }
+        ctx.gpr[2] = static_cast<std::uint32_t>(g_host.savedata_status);
+    });
+    bind("sceUtility", 0xD4B95FFBu, "sceUtilitySavedataUpdate", [](Runtime &, AllegrexContext &ctx) {
+        if (g_host.vblank_count <= 60u) {
+            std::cout << "[savedata] Update status=" << g_host.savedata_status
+                      << " frame=" << g_host.vblank_count << "\n" << std::flush;
+        }
+        ctx.gpr[2] = 0u;
+    });
+    bind("sceUtility", 0x9790B33Cu, "sceUtilitySavedataShutdownStart", [](Runtime &, AllegrexContext &ctx) {
+        g_host.savedata_status = 4;  // SCE_UTILITY_STATUS_SHUTDOWN
+        std::cout << "[savedata] ShutdownStart frame=" << g_host.vblank_count << "\n" << std::flush;
+        ctx.gpr[2] = 0u;
+    });
+
     // --- sceDisplay: no pixels, but a real frame clock. A vblank wait is not a no-op and it is not
     // a free counter bump either: it parks the caller until guest time reaches the next frame
     // boundary. Several threads waiting on the display in the same period all resume on that one
@@ -4004,6 +4120,14 @@ int mgsa_main(int argc, char **argv) {
             g_host.press_from = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
         } else if (arg == "--png" && i + 1 < argc) {
             g_host.png_path = argv[++i];
+        } else if (arg == "--pchist-range" && i + 2 < argc) {
+            // A retired-instruction histogram over one address window. Coverage inside a module
+            // that keeps running but changes nothing is the difference between "this code is the
+            // gate" and "this code was never reached".
+            g_host.pchist_low = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
+            g_host.pchist_high = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
+            psprecomp::set_pc_histogram_enabled(true);
+            psprecomp::set_pc_histogram_thread(psprecomp::kAllThreads);
         } else if (arg == "--touch-file" && i + 1 < argc) {
             const std::string path = argv[++i];
             const std::size_t n = g_host.touch.load_file(path);
@@ -4013,6 +4137,12 @@ int mgsa_main(int argc, char **argv) {
     }
     if (g_host.game_root.empty()) g_host.game_root = "extract";
     g_host.save_root = "work/ms0";
+    if (const char *env = std::getenv("MGSA_IMPOSE_RET")) {
+        g_host.impose_ret = static_cast<std::uint32_t>(std::stoul(env, nullptr, 0));
+    }
+    if (const char *env = std::getenv("MGSA_IMPOSE_RET")) {
+        g_host.impose_ret = static_cast<std::uint32_t>(std::stoul(env, nullptr, 0));
+    }
 
     // The extracted tree came from an ISO on this machine. Finding it makes the raw-sector device
     // real instead of a lie; if it is not there, that open fails with NOENT and the log says why.
@@ -4140,7 +4270,13 @@ int mgsa_main(int argc, char **argv) {
         std::cout << "--- running from entry " << hex32(entry) << " (max " << max_dispatches << " dispatches)\n"
                   << std::flush;
         const auto started = std::chrono::steady_clock::now();
-        runtime.run(entry, max_dispatches);
+        try {
+            runtime.run(entry, max_dispatches);
+        } catch (const std::exception &e) {
+            std::cout << "--- EXCEPTION: " << e.what() << "\n" << std::flush;
+        } catch (...) {
+            std::cout << "--- UNKNOWN EXCEPTION\n" << std::flush;
+        }
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         std::cout << "--- run stopped after " << g_host.dispatches << " dispatches in " << elapsed_ms << " ms\n";
@@ -4151,6 +4287,7 @@ int mgsa_main(int argc, char **argv) {
                   << " GE lists queued, guest time " << g_host.virtual_us / 1000u << " ms\n";
         std::cout << "--- guest time per frame: "
                   << (g_host.vblank_count == 0u ? 0u : g_host.virtual_us / g_host.vblank_count) << " us\n";
+
         {
             std::vector<std::pair<std::uint32_t, std::uint64_t>> callers(
                 g_host.vblank_callers.begin(), g_host.vblank_callers.end());
@@ -4238,6 +4375,9 @@ int mgsa_main(int argc, char **argv) {
         }
 
         runtime.report_hle_histogram();
+        if (g_host.pchist_high > g_host.pchist_low) {
+            psprecomp::report_pc_histogram(80u, g_host.pchist_low, g_host.pchist_high);
+        }
         if (g_host.widget_hits > 0u) {
             std::cout << "[widget] entered " << g_host.widget_hits << " times\n";
         }
