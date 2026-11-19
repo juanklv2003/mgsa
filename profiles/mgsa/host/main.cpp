@@ -63,6 +63,15 @@ struct Block {
     std::uint32_t id{};
     std::uint32_t address{};
     std::uint32_t size{};
+    bool freed{};
+};
+
+// A span of the guest arena the guest has handed back. New allocations are served from these
+// before the bump pointer moves, because the engine recycles its per-stage pools and a bump
+// pointer that only ever advances runs the arena dry on the second stage.
+struct FreeRange {
+    std::uint32_t address{};
+    std::uint32_t size{};
 };
 
 enum class ThreadState { Dormant, Ready, Running, Waiting, Dead };
@@ -131,6 +140,10 @@ struct FplPool {
     std::uint32_t block_count{};
     std::uint32_t base{};
     std::uint32_t handed_out{};
+    std::uint32_t block_id{};
+    // Block indices still free, newest first. A block the guest frees has to come back on the
+    // next allocate, or a stage that recycles its pool starves after the first pass.
+    std::vector<std::uint32_t> available;
 };
 
 // One open guest file. psiPSP uids are opaque to the guest; only stability matters.
@@ -301,6 +314,7 @@ struct Host {
     std::uint32_t next_id{1};
     std::uint32_t arena_next{};
     std::uint32_t arena_end{};
+    std::vector<FreeRange> free_ranges;
     std::uint64_t ticks{};
     std::vector<GuestThread> threads;
     std::vector<GuestEventFlag> event_flags;
@@ -383,12 +397,62 @@ struct Host {
     [[nodiscard]] std::uint32_t allocate(std::uint32_t size, std::uint32_t align) noexcept {
         if (size == 0u) size = 16u;
         if (align < 16u) align = 16u;
+        // First fit over what the guest already released, then bump.
+        for (std::size_t i = 0; i < free_ranges.size(); ++i) {
+            const std::uint32_t range_start = free_ranges[i].address;
+            const std::uint32_t range_end = range_start + free_ranges[i].size;
+            const std::uint32_t start = (range_start + align - 1u) & ~(align - 1u);
+            if (start < range_start || start > range_end || size > range_end - start) continue;
+            const std::uint32_t head = start - range_start;
+            const std::uint32_t tail = range_end - (start + size);
+            if (head == 0u) {
+                if (tail == 0u) {
+                    free_ranges.erase(free_ranges.begin() + static_cast<std::ptrdiff_t>(i));
+                } else {
+                    free_ranges[i] = FreeRange{start + size, tail};
+                }
+            } else {
+                free_ranges[i] = FreeRange{range_start, head};
+                if (tail != 0u) free_ranges.push_back(FreeRange{start + size, tail});
+            }
+            const std::uint32_t id = next_id++;
+            blocks.push_back(Block{id, start, size, false});
+            return id;
+        }
         const std::uint32_t base = (arena_next + align - 1u) & ~(align - 1u);
         if (base > arena_end || size > arena_end - base) return 0u;
         arena_next = base + size;
         const std::uint32_t id = next_id++;
-        blocks.push_back(Block{id, base, size});
+        blocks.push_back(Block{id, base, size, false});
         return id;
+    }
+
+    // Hand a block back and merge it with every touching range, so a freed multi-megabyte pool
+    // can satisfy the next stage's request instead of leaving the arena fragmented forever.
+    void release(std::uint32_t id) noexcept {
+        for (auto &block : blocks) {
+            if (block.id != id || block.freed) continue;
+            block.freed = true;
+            std::uint32_t address = block.address;
+            std::uint32_t size = block.size;
+            for (std::size_t i = 0; i < free_ranges.size();) {
+                const std::uint32_t other_end = free_ranges[i].address + free_ranges[i].size;
+                if (other_end == address) {
+                    address = free_ranges[i].address;
+                    size += free_ranges[i].size;
+                    free_ranges.erase(free_ranges.begin() + static_cast<std::ptrdiff_t>(i));
+                    continue;
+                }
+                if (free_ranges[i].address == address + size) {
+                    size += free_ranges[i].size;
+                    free_ranges.erase(free_ranges.begin() + static_cast<std::ptrdiff_t>(i));
+                    continue;
+                }
+                ++i;
+            }
+            free_ranges.push_back(FreeRange{address, size});
+            return;
+        }
     }
 
     [[nodiscard]] std::uint32_t block_address(std::uint32_t id) const noexcept {
@@ -399,7 +463,9 @@ struct Host {
     }
 
     [[nodiscard]] std::uint32_t free_bytes() const noexcept {
-        return arena_end > arena_next ? arena_end - arena_next : 0u;
+        std::uint32_t total = arena_end > arena_next ? arena_end - arena_next : 0u;
+        for (const auto &range : free_ranges) total += range.size;
+        return total;
     }
 };
 
@@ -1535,7 +1601,7 @@ void prx_import_thunk(Runtime &runtime, AllegrexContext &ctx) {
     const PrxImportSite import = g_host.prx_imports[stub->second];
     note_import_call(import.library + "::" + hex32(import.nid));
     const std::uint32_t return_address = ctx.gpr[31];
-    // Temporary: keep the last few imports so a fault can be traced to the host call before it.
+    // Keep the last few imports so a fault can be traced to the host call before it.
     if (g_host.recent_imports.size() >= 40u) g_host.recent_imports.erase(g_host.recent_imports.begin());
     {
         std::ostringstream line;
@@ -2093,6 +2159,8 @@ static std::uint32_t sample_clut4(const psprecomp::GuestMemory &memory,
 static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t start,
                               std::uint32_t fb_base, std::uint32_t width, std::uint32_t height) {
     std::uint32_t pc = start;
+    std::array<std::uint32_t, 8> call_stack{};
+    std::size_t call_depth = 0u;
     std::uint32_t base_extended = 0u;
     std::uint32_t offset_address = 0u;
     std::uint32_t vertex_address = 0u;
@@ -2183,7 +2251,10 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
             }
             const std::uint32_t pos_size = kCompSize[position_type];
             const std::uint32_t pos_offset = off;
-            const std::uint32_t vertex_stride = ((off + pos_size + 3) / 4) * 4;
+            // A vertex carries three position components, so the stride spans the whole xyz
+            // triple. Counting one component truncated the stride and the second vertex of
+            // every sprite landed inside the first, which draws a zero-area quad.
+            const std::uint32_t vertex_stride = ((off + pos_size * 3u + 3u) / 4u) * 4u;
             std::uint32_t tex_w = texture_buffer_width;
             std::uint32_t tex_h = texture_buffer_width;
             if (texture_size != 0u) {
@@ -2270,8 +2341,19 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
         }
         if (command == 0x0Eu) continue;
         if (command == 0x08u) { pc = relative(data) & 0x0FFFFFFCu; continue; }
-        if (command == 0x0Au) continue;
-        if (command == 0x0Bu) break;
+        // CALL: the engine builds a frame by calling one sub-list per object, so ignoring this
+        // opcode skips every draw command in the frame and leaves EDRAM untouched.
+        if (command == 0x0Au) {
+            if (call_depth < call_stack.size()) call_stack[call_depth++] = pc;
+            pc = relative(data) & 0x0FFFFFFCu;
+            continue;
+        }
+        // RET returns to the command after the CALL that entered the sub-list.
+        if (command == 0x0Bu) {
+            if (call_depth == 0u) break;
+            pc = call_stack[--call_depth];
+            continue;
+        }
         if (command == 0x0Cu || command == 0x0Fu) break;
     }
 }
@@ -2327,9 +2409,22 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
     bind("SysMemUserForUser", 0x9D9A5BA1u, "sceKernelGetBlockHeadAddr", [](Runtime &, AllegrexContext &ctx) {
         ctx.gpr[2] = g_host.block_address(ctx.gpr[4]);
     });
-    // sceKernelFreePartitionMemory(uid)
+    // sceKernelFreePartitionMemory(uid): the engine recycles its stage heaps, so this has to
+    // actually return the region. A no-op here exhausts the arena on the second stage.
     bind("SysMemUserForUser", 0xB6D61D02u, "sceKernelFreePartitionMemory",
-        [](Runtime &, AllegrexContext &ctx) { ctx.gpr[2] = 0u; });
+        [](Runtime &, AllegrexContext &ctx) {
+            const std::uint32_t uid = ctx.gpr[4];
+            const std::uint32_t address = g_host.block_address(uid);
+            g_host.release(uid);
+            static int logged = 0;
+            if (logged < 24) {
+                ++logged;
+                std::cout << "[sysmem] free uid=" << uid << " at " << hex32(address) << " -> "
+                          << (g_host.free_bytes() / 1024u) << " KiB free\n"
+                          << std::flush;
+            }
+            ctx.gpr[2] = 0u;
+        });
 
     // --- ThreadManForUser
     // sceKernelCreateThread(name, entry, priority, stack_size, attr, option)
@@ -2752,10 +2847,18 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
             return;
         }
         const std::uint32_t id = g_host.next_id++;
-        g_host.fpls.push_back(FplPool{id, std::max(block_size, 16u), blocks, g_host.block_address(block_id), 0u});
+        FplPool pool;
+        pool.id = id;
+        pool.block_size = std::max(block_size, 16u);
+        pool.block_count = blocks;
+        pool.base = g_host.block_address(block_id);
+        pool.block_id = block_id;
+        pool.available.reserve(blocks);
+        for (std::uint32_t i = blocks; i > 0u; --i) pool.available.push_back(i - 1u);
         std::cout << "[fpl]   CreateFpl " << block_size << "x" << blocks << " -> uid " << id << " at "
-                  << hex32(g_host.block_address(block_id)) << "\n"
+                  << hex32(pool.base) << " free=" << (g_host.free_bytes() / 1024u) << " KiB\n"
                   << std::flush;
+        g_host.fpls.push_back(std::move(pool));
         ctx.gpr[2] = id;
     });
     // sceKernelAllocateFpl(uid, void **ptr, unsigned *timeout)
@@ -2765,11 +2868,13 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         const std::uint32_t timeout = ctx.gpr[6];
         for (auto &pool : g_host.fpls) {
             if (pool.id != uid) continue;
-            if (pool.handed_out >= pool.block_count) {
+            if (pool.available.empty()) {
                 ctx.gpr[2] = 0x80020101u;
                 return;
             }
-            const std::uint32_t address = pool.base + pool.handed_out * pool.block_size;
+            const std::uint32_t index = pool.available.back();
+            pool.available.pop_back();
+            const std::uint32_t address = pool.base + index * pool.block_size;
             if (out != 0u) runtime.memory().store32(out, address);
             if (timeout != 0u) runtime.memory().store32(timeout, 0u);
             ++pool.handed_out;
@@ -2780,12 +2885,39 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         std::cout << "[fpl]   AllocateFpl unknown uid " << uid << "\n" << std::flush;
         ctx.gpr[2] = 0x80020101u;
     });
-    // Not imported by this module yet, but harmless to have and cheap to keep honest.
+    // sceKernelFreeFpl(uid, void *ptr): the block goes back to its pool.
     bind("ThreadManForUser", 0xEDAD5C5Fu, "sceKernelFreeFpl", [](Runtime &, AllegrexContext &ctx) {
-        ctx.gpr[2] = 0u;
+        const std::uint32_t uid = ctx.gpr[4];
+        const std::uint32_t address = ctx.gpr[5];
+        for (auto &pool : g_host.fpls) {
+            if (pool.id != uid) continue;
+            if (address < pool.base || pool.block_size == 0u) break;
+            const std::uint32_t offset = address - pool.base;
+            if (offset % pool.block_size != 0u) break;
+            const std::uint32_t index = offset / pool.block_size;
+            if (index >= pool.block_count) break;
+            bool present = false;
+            for (const std::uint32_t free_index : pool.available) present = present || free_index == index;
+            if (!present) {
+                pool.available.push_back(index);
+                if (pool.handed_out > 0u) --pool.handed_out;
+            }
+            ctx.gpr[2] = 0u;
+            return;
+        }
+        ctx.gpr[2] = 0x80020101u;
     });
+    // sceKernelDeleteFpl(uid): the pool's whole region returns to the arena.
     bind("ThreadManForUser", 0x15A6D35Fu, "sceKernelDeleteFpl", [](Runtime &, AllegrexContext &ctx) {
-        ctx.gpr[2] = 0u;
+        const std::uint32_t uid = ctx.gpr[4];
+        for (std::size_t i = 0; i < g_host.fpls.size(); ++i) {
+            if (g_host.fpls[i].id != uid) continue;
+            g_host.release(g_host.fpls[i].block_id);
+            g_host.fpls.erase(g_host.fpls.begin() + static_cast<std::ptrdiff_t>(i));
+            ctx.gpr[2] = 0u;
+            return;
+        }
+        ctx.gpr[2] = 0x80020101u;
     });
 
     // --- ModuleMgrForUser: the boot loads its engine modules from the disc image and starts them.
@@ -2875,31 +3007,9 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
         std::cout << "[module] start uid=" << uid << " '" << module.name << "' entry=" << hex32(module.entry)
                   << " argc=" << argsize << " argv=" << hex32(argp) << "\n"
                   << std::flush;
-        // Temporary: dump argv contents for mgp_stage to find function pointers.
-        if (module.name == "mgp_stage" && argp != 0u) {
-            for (std::uint32_t i = 0u; i < argsize && i < 8u; ++i) {
-                const std::uint32_t ptr = runtime.memory().contains(argp + i * 4u, 4u)
-                    ? runtime.memory().aot_load32(argp + i * 4u) : 0u;
-                std::cout << "[module]   argv[" << i << "] = " << hex32(ptr) << "\n" << std::flush;
-            }
-            // After module_start runs, read the function pointers it wrote.
-            // module_start writes to *argv[0] and *argv[1].
-            const std::uint32_t fp0_addr = runtime.memory().contains(argp, 4u) ? runtime.memory().aot_load32(argp) : 0u;
-            const std::uint32_t fp1_addr = runtime.memory().contains(argp + 4u, 4u) ? runtime.memory().aot_load32(argp + 4u) : 0u;
-            // These will be set after module_start returns. Log them after.
-        }
         ctx.gpr[4] = argsize;
         ctx.gpr[5] = argp;
         enter_guest_code(runtime, ctx, module, module.entry, FrameKind::ModuleStart, status_out);
-        // Log function pointers set by mgp_stage's module_start.
-        if (module.name == "mgp_stage" && argp != 0u) {
-            const std::uint32_t fp0_addr = runtime.memory().contains(argp, 4u) ? runtime.memory().aot_load32(argp) : 0u;
-            const std::uint32_t fp1_addr = runtime.memory().contains(argp + 4u, 4u) ? runtime.memory().aot_load32(argp + 4u) : 0u;
-            const std::uint32_t fp0 = (fp0_addr != 0u && runtime.memory().contains(fp0_addr, 4u)) ? runtime.memory().aot_load32(fp0_addr) : 0u;
-            const std::uint32_t fp1 = (fp1_addr != 0u && runtime.memory().contains(fp1_addr, 4u)) ? runtime.memory().aot_load32(fp1_addr) : 0u;
-            std::cout << "[module]   mgp_stage fp0 (argv[0]=" << hex32(fp0_addr) << ") = " << hex32(fp0) << "\n" << std::flush;
-            std::cout << "[module]   mgp_stage fp1 (argv[1]=" << hex32(fp1_addr) << ") = " << hex32(fp1) << "\n" << std::flush;
-        }
     });
     bind("ModuleMgrForUser", 0xD1FF982Au, "sceKernelStopModule", [](Runtime &, AllegrexContext &ctx) {
         const std::size_t index = find_loaded_module_by_uid(ctx.gpr[4]);
@@ -4272,6 +4382,34 @@ int mgsa_main(int argc, char **argv) {
             std::chrono::steady_clock::now() - started).count();
         std::cout << "--- run stopped after " << g_host.dispatches << " dispatches in " << elapsed_ms << " ms\n";
         std::cout << "--- reason: " << runtime.stop_reason() << "\n";
+        // Where every guest thread is parked. A screen with nothing on it is usually one thread
+        // blocked on an object nobody ever signals, so the exit report names the waiter.
+        {
+            static const char *const kStates[] = {"Dormant", "Ready", "Running", "Waiting", "Dead"};
+            static const char *const kKinds[] = {"None", "Delay", "Sleep", "EventFlag",
+                                                 "Semaphore", "ThreadEnd", "Vblank"};
+            std::cout << "--- threads (" << g_host.threads.size() << ")\n";
+            for (const auto &t : g_host.threads) {
+                std::cout << "    uid=" << t.uid << " '" << t.name << "' "
+                          << kStates[static_cast<int>(t.state)]
+                          << " wait=" << kKinds[static_cast<int>(t.wait_kind)]
+                          << " obj=" << hex32(t.wait_object)
+                          << " bits=" << hex32(t.wait_bits)
+                          << " prio=" << t.priority
+                          << " pc=" << hex32(t.context.pc) << "\n";
+            }
+        }
+        {
+            std::cout << "--- arena next=" << hex32(g_host.arena_next) << " end=" << hex32(g_host.arena_end)
+                      << " free=" << (g_host.free_bytes() / 1024u) << " KiB ranges="
+                      << g_host.free_ranges.size() << "\n";
+            std::size_t shown = 0;
+            for (const auto &range : g_host.free_ranges) {
+                if (shown++ >= 12u) break;
+                std::cout << "    free " << hex32(range.address) << " .. "
+                          << hex32(range.address + range.size) << " (" << (range.size / 1024u) << " KiB)\n";
+            }
+        }
         // The frame clock is the measurement that matters: a run that presents frames is a
         // game loop, and one that does not is a stall, whatever the dispatch count says.
         std::cout << "--- frames: " << g_host.vblank_count << " presented, " << g_host.ge_lists_queued
