@@ -65,3 +65,13 @@ L8 (2026-11-19): TOOK MY OWN ADVICE -- a bounded dynamic trace beat static RE. I
 3. Active task mask at 0x089C207C = 0x00200287 (bits 0,1,2,7,13,21). Frame counter at 0x089B7DD8 = 0.
 
 Next concrete step: map which mask bit is the title-stage load task (read mask consumers at generated_unit_0071.cpp lines 15699/15976/16031/16048/16615/16883/18027) and determine why its bit is not set / its handler is a no-op. The fast trace technique is the way to verify each hypothesis. All trace code reverted; working tree clean.
+
+L9 (2026-11-19): CORRECTION to L8 -- several of my L8 interpretations were wrong, recorded so they are not repeated. Follow-up traces (run70-run77) established:
+- 0x089238C8 is NOT a task enqueuer; it is a generic per-call helper invoked from many unrelated callers (ra=0x0887DD90, 0x0888853C, 0x08887948...). Its a0 values are indices/sizes, not task ids.
+- The mask 0x089C207C writers are 0x08922F54 (init), 0x089238C8 (set bit), 0x08923B9C (clear bit). It oscillates 0->0x2->0x6->0x86->0x200086->0x200087->0x200086 as normal tasks run and finish.
+- The stage-load request entry 0x0891BA00 is NEVER entered in a whole run (run74: zero stagereq hits), and no word in guest RAM holds its address (run73 ptrscan total=0). So it is not invoked by pointer or direct call.
+- The functions at 0x286C and 0xCE38 are NOT stage-init code; 0xCE38/0xCE60 are mgp_stage's IMPORT STUBS (sceUtilityGetSystemParamInt and sceImpose). The write-watch 'store16 at 0x09FECE38' was the engine patching the stub, not writing a state word.
+- The single authoritative trace (run77) shows mgp_stage executes ONLY its +0x1B8 language function in frame 36: `GetSystemParamInt(8)->1` at stub 0xDE60, then `sceImpose(1,0)->0` at stub 0xDE38, then nothing. It never enters a state machine and the engine never calls a get_state on it.
+- sceUtility savedata is NEVER called (zero [savedata] lines in any log), so MGSA_SAVEDATA_FINISHED and the savedata gate are irrelevant.
+
+Net: every concrete lead this session ended in 'the engine never enters the stage state machine at all'. The original #70 conclusion stands: the trigger lives in BOOT.BIN's main loop and is not reached. Despite many bounded traces, the exact missing condition is still unidentified. All trace code reverted; tree clean; last pushed aeb1d65.
