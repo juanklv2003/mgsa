@@ -45,6 +45,25 @@ the per-stage "logic" is likely these string indices plus a small command
 sequence not yet isolated. This is enough for a native UI: the text and its
 index mapping are directly usable.
 
+### Exhaustion check (2026-11-19)
+
+Tried to isolate a command/opcode sequence from the data side:
+- The directory entry gives `scenerio.gcx size=0x71e5a, crc=0x41ec68d2` but
+  that exact payload is NOT a contiguous slice of the inflated image (CRC scan
+  over all aligned starts found nothing) and NOT any single `78 9c` stream
+  inside it. The inflated image is a container (`cache.dar`-like) whose members
+  are addressed by the page-offset arrays, not by simple concatenation.
+- The 2,937-entry pointer table at `0x4000` is a **string index**, and its tail
+  (indices 2800+) is just item/card names in the 5 languages with shared
+  substrings — it is a dictionary, not an ordered command stream.
+
+Conclusion for path (a): the data side yields the full UI text and its index
+mapping (done), but NOT the command sequence that triggers a stage load — that
+sequence lives in engine code and references these indices. The data-format
+path has reached its useful limit for the stage-load gate. Further progress on
+the gate requires reading the engine command-selection code (path (b) in the
+journal is out of scope per the no-emulator-oracle constraint).
+
 ## UI strings — EXTRACTED (deliverable)
 
 The game stores UI/card text **uncompressed** inside the `_zar`. Extracted
