@@ -119,3 +119,33 @@ and check whether the engine ever requests it. Two concrete options:
    is missing or returns an error.
 
 Option 2 is a single bounded trace (log `a1`/`a2` at each thunk entry, frames 0-45).
+
+- [x] Traced all method hashes (run83/84). Map of `(hash, idx)` requested from
+      mgp_stage, all one-shot commands in frame 36:
+      - `0x00DD258E idx=0x0B` at module offset `0x12C` = `mount_current_stage`
+      - `0x002986E9 idx=0x01` at `0x1B8` = language/impose setter
+      - `0x006F7D4D idx=0x07` at `0x70`
+      - `0x00DE07C0 idx=0x0C` at `0x90`
+      - `0x003A9224 idx=0x03` at `0x2090`
+      - `0x00D42B14 idx=0x0A` at `0x286C`
+      Repeated polls: `0x00542B2D idx=5` (42×), `0x006B237D idx=6` (38×),
+      `0x00C74F97 idx=9` (24×).
+      The engine DOES request the mount command, and its return is 0 (success).
+      Non-zero returns at the thunk were only query values (`0xC09262B6`, `0x1`,
+      `0x3FF`, `0xF`) -- no error.
+
+## Assessment after full hash trace
+
+The engine requests every stage command in frame 36 and they return plausible
+values. The blocker is NOT a missing command, NOT an error return, and NOT a
+state the methods report. What remains unexamined is the ENGINE side of the
+thunk: `0x08808258` (generated_unit_0001.cpp:4840-4853), which builds the method
+call and then decides what to do with the result. The decision to actually
+load `title.prx` must be in that function or its caller, not in mgp_stage.
+
+The bounded-trace approach has now been applied to every layer (dispatcher,
+methods, hashes, returns). Further progress requires reading the AOT logic at
+`L_08808258` backwards to its caller and following the branch on the result --
+static reading of ~a few hundred instructions, not more dynamic probes.
+
+Host code clean; all temporary traces reverted; build verified.
