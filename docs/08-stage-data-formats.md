@@ -29,9 +29,21 @@ u32 crc32         (e.g. scenerio.gcx = 0x41ec68d2)
 Padding between name and fields is 4 bytes (`name\0\0\0` for len%4==...).
 
 A table of `u32` pointers with the high bit set (`0x8005a0ed`, `0x8005a0fe`,
-...) appears around offset `0x5000`. Likely the script's opcode/command pointer
-table, but the address base is not `0x08000000` (canonicalization puts it
-out of range), so the base is still unknown.
+...) appears around offset `0x5000`. **RESOLVED**: the base is **`0x80000000`**.
+The table from `0x4000` to `0x6de4` holds 2,937 pointers `0x80000000 + offset`
+into the string block at `0x5885f..0x61149` — it is a string-index table, not
+opcodes. Resolved all 2,937 `(index, ptr, offset, text)` pairs to
+`work/gcx_string_table.txt`. Consecutive pointers often point into overlapping
+substrings (space optimization). A second table at `0x5000` indexes German
+item descriptions the same way (`0x8005a0ed -> 0x5a0ed`).
+
+Text contains format control tokens: `0x8c16`, `0x8305`, `0x1f0b` embedded in
+the strings (number/color/parameter markers for the engine's text renderer).
+
+So `scenerio.gcx`'s 0x71e5a bytes are mostly the 5-language string database;
+the per-stage "logic" is likely these string indices plus a small command
+sequence not yet isolated. This is enough for a native UI: the text and its
+index mapping are directly usable.
 
 ## UI strings — EXTRACTED (deliverable)
 
