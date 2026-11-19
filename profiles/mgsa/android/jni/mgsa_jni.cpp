@@ -21,10 +21,13 @@
 #include <string>
 #include <vector>
 
+#include "ui.hpp"
+
 // C API from main.cpp (compiled with -DMGSA_ANDROID_LIBRARY).
 extern "C" {
 void mgsa_enable_touch();
 void mgsa_touch_event(int kind, int id, float x, float y);
+void mgsa_press_button(std::uint32_t buttons);
 int  mgsa_read_frame(std::uint8_t *dst, int dst_len);
 int  mgsa_frame_width();
 int  mgsa_frame_height();
@@ -69,7 +72,14 @@ int32_t on_input(android_app *app, AInputEvent *event) {
                                                              >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT)
                                   : 0u;
         const int id = AMotionEvent_getPointerId(event, p);
-        mgsa_touch_event(0, id, px(p), py(p));
+        // A tap on a native-UI menu row synthesizes that row's PSP button.
+        const std::uint32_t menu_button = mgsa::ui_menu_hit(static_cast<int>(px(p)),
+                                                            static_cast<int>(py(p)));
+        if (menu_button != 0u) {
+            mgsa_press_button(menu_button);
+        } else {
+            mgsa_touch_event(0, id, px(p), py(p));
+        }
     } else if (index == AMOTION_EVENT_ACTION_UP ||
                index == AMOTION_EVENT_ACTION_POINTER_UP) {
         const std::size_t p = (index == AMOTION_EVENT_ACTION_POINTER_UP)
@@ -188,18 +198,10 @@ void render(ANativeWindow *window) {
         frame[i] = 0xFFu;
     }
     if (!has_visible) {
-        // Diagnostic fallback: the guest produced only a transparent clear. Paint a
-        // visible gradient + cross so the screen is not dead and touch can be tested.
-        for (int y = 0; y < fh; ++y) {
-            for (int x = 0; x < fw; ++x) {
-                const std::size_t o = (static_cast<std::size_t>(y) * fw + x) * 4u;
-                const bool cross = (std::abs(x - fw/2) < 3) || (std::abs(y - fh/2) < 3);
-                frame[o+0] = cross ? 0xFFu : static_cast<std::uint8_t>(x * 255 / fw);
-                frame[o+1] = cross ? 0xFFu : static_cast<std::uint8_t>(y * 255 / fh);
-                frame[o+2] = cross ? 0x40u : 0x60u;
-                frame[o+3] = 0xFFu;
-            }
-        }
+        // Native touch UI: the guest produced only a transparent clear. Draw a real
+        // menu using the game's own UI strings extracted from stage/title/_zar
+        // (docs/08). Tapping a row synthesizes the matching PSP button.
+        mgsa::ui_draw_menu(frame.data(), fw, fh);
     }
 
     ANativeWindow_Buffer buf;

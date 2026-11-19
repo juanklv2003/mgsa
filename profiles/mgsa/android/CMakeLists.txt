@@ -32,6 +32,7 @@ add_library(mgsa SHARED
     ${MGSA_HOST}/main.cpp
     ${MGSA_HOST}/touch.cpp
     ${MGSA_HOST}/framebuffer.cpp
+    ${MGSA_HOST}/ui.cpp
     ${AOT_UNITS}
     ${AOT_REGISTRY}
     ${CMAKE_CURRENT_SOURCE_DIR}/jni/mgsa_jni.cpp

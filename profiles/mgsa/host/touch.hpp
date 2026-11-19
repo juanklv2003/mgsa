@@ -70,6 +70,9 @@ public:
     // "up <id>". '#' starts a comment.
     std::size_t load_file(const std::string &path);
 
+    // Latch a synthetic button for a number of polls (native UI menu rows).
+    void press_button(std::uint32_t buttons, std::uint32_t polls = 2u);
+
     bool empty() const { return queue_.empty(); }
 
 private:

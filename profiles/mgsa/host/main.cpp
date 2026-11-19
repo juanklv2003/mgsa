@@ -4633,6 +4633,11 @@ void mgsa_touch_event(int kind, int id, float x, float y) {
     g_host.touch.push({k, static_cast<std::uint32_t>(id), x, y});
 }
 
+void mgsa_press_button(std::uint32_t buttons) {
+    // Hold the synthetic button for one poll frame so edge-detect sees it.
+    g_host.touch.press_button(buttons, 2u);
+}
+
 std::uint32_t mgsa_touch_pending() { return static_cast<std::uint32_t>(g_host.touch.empty() ? 0u : 1u); }
 
 int mgsa_read_frame(std::uint8_t *dst, int dst_len) {

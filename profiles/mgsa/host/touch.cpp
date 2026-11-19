@@ -103,6 +103,11 @@ InputState TouchLayer::poll(std::uint32_t display_frame) {
     return out;
 }
 
+void TouchLayer::press_button(std::uint32_t buttons, std::uint32_t polls) {
+    latch_ = buttons;
+    latch_until_frame_ = frame_ + (polls == 0u ? 1u : polls);
+}
+
 std::size_t TouchLayer::load_file(const std::string &path) {
     std::ifstream in(path);
     if (!in) return 0u;
