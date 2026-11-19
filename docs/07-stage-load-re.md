@@ -149,3 +149,29 @@ methods, hashes, returns). Further progress requires reading the AOT logic at
 static reading of ~a few hundred instructions, not more dynamic probes.
 
 Host code clean; all temporary traces reverted; build verified.
+
+## Engine-side call chain (static AOT reading, 2026-11-19)
+
+Followed the thunk backwards through the AOT:
+
+- `0x08808248`–`0x08808258` (generated_unit_0001.cpp:4835-4848) is a **null-guarded
+  method-call wrapper**: `if (gpr[3]==0) return -1;` else save `v0=1` to
+  `gpr[17]+0x6804`, set `ra=0x08808260`, tail-call `gpr[3]` (the method pointer).
+  The `gpr[2]` seen at `0x08808260` after the call is the method's real return.
+- Its caller is `L_08808244`, fed by `invoke_chained_direct(... 0x08806288)` — so
+  `0x08806288` (recomp_unit_0000) **resolves the method by hash**.
+- Before that, `L_08808234` calls `0x08879F28` (recomp_unit_0029) which returns the
+  method pointer. So `0x08879F28` is where the engine **selects which command to send**.
+- `0x08879F28` is itself a wrapper around a chain: `0x08879EF0` and `0x08879D20`.
+  The actual decision logic is deep in that wrapper chain (4+ levels).
+
+This is the true location of the missing condition: the engine's command-selection
+logic around `0x08879D20`, not mgp_stage. Following a 4-level wrapper chain
+instruction-by-instruction is slow and low-yield compared with a targeted dynamic
+read of which command the engine chooses at frame 36 — but every method the engine
+already requested returned plausibly, so the likely failure is a command it does
+NOT send (or a branch after a query result) in that chain.
+
+Status: architecture fully understood, blocker localized to engine command
+selection. No further dynamic probes planned until there is a specific hypothesis
+about which command/branch is missing.
