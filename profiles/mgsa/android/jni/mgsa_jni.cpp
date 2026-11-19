@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "ui.hpp"
+#include "asset_list.h"
 
 // C API from main.cpp (compiled with -DMGSA_ANDROID_LIBRARY).
 extern "C" {
@@ -58,11 +59,17 @@ int32_t on_input(android_app *app, AInputEvent *event) {
     const float screen_h = static_cast<float>(ANativeWindow_getHeight(app->window));
     if (screen_w <= 0.0f || screen_h <= 0.0f) return 0;
 
+    // Invert the render() letterbox transform: screen -> 480x272 board space.
+    const float fw = static_cast<float>(mgsa_frame_width());
+    const float fh = static_cast<float>(mgsa_frame_height());
+    const float scale = (screen_w / fw < screen_h / fh) ? screen_w / fw : screen_h / fh;
+    const float off_x = (screen_w - fw * scale) / 2.0f;
+    const float off_y = (screen_h - fh * scale) / 2.0f;
     const auto px = [&](std::size_t p) {
-        return AMotionEvent_getX(event, p) / screen_w * 480.0f;
+        return (AMotionEvent_getX(event, p) - off_x) / scale;
     };
     const auto py = [&](std::size_t p) {
-        return AMotionEvent_getY(event, p) / screen_h * 272.0f;
+        return (AMotionEvent_getY(event, p) - off_y) / scale;
     };
 
     if (index == AMOTION_EVENT_ACTION_DOWN ||
@@ -98,45 +105,46 @@ int32_t on_input(android_app *app, AInputEvent *event) {
     return 1;
 }
 
-// Copy an asset subtree to a real filesystem directory so the host's std::ifstream
-// paths work. Kept minimal: regular files only, directories created on demand.
-static void extract_assets(AAssetManager *mgr, const char *asset_dir, const std::string &out_dir) {
-    AAssetDir *dir = AAssetManager_openDir(mgr, asset_dir);
-    if (dir == nullptr) {
-        __android_log_print(ANDROID_LOG_WARN, "MGSA", "no asset dir %s", asset_dir);
-        return;
+// mkdir -p for a path relative to the app files dir.
+static void mkdir_p(const std::string &path) {
+    std::string cur;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '/') {
+            if (!cur.empty()) mkdir(cur.c_str(), 0777);
+        }
+        cur.push_back(path[i]);
     }
-    mkdir(out_dir.c_str(), 0777);
+    // The final component has no trailing '/', so create it explicitly.
+    if (!cur.empty()) mkdir(cur.c_str(), 0777);
+}
+
+// Copy the bundled game tree from assets to a real filesystem directory.
+//
+// AAssetDir_getNextFileName does NOT enumerate compressed assets on some
+// Android versions (verified on the Pixel 9a: openDir("extract") succeeds but
+// yields zero entries, while AAssetManager_open on a known file works). So we
+// iterate a build-time list of asset paths and open each one directly.
+static void extract_assets(AAssetManager *mgr, const std::string &out_dir) {
     int copied = 0;
-    const char *name;
-    while ((name = AAssetDir_getNextFileName(dir)) != nullptr) {
-        std::string rel = std::string(asset_dir) + "/" + name;
-        std::string dst = out_dir + "/" + name;
-        // A subdirectory has at least one entry. Try opening as a dir first.
-        AAssetDir *sub = AAssetManager_openDir(mgr, rel.c_str());
-        bool is_dir = false;
-        if (sub != nullptr) {
-            const char *first = AAssetDir_getNextFileName(sub);
-            is_dir = (first != nullptr);
-            AAssetDir_close(sub);
+    for (int i = 0; i < kAssetFileCount; ++i) {
+        const char *asset_path = kAssetFiles[i];
+        AAsset *a = AAssetManager_open(mgr, asset_path, AASSET_MODE_STREAMING);
+        if (a == nullptr) {
+            __android_log_print(ANDROID_LOG_WARN, "MGSA", "cannot open asset %s", asset_path);
+            continue;
         }
-        if (is_dir) {
-            extract_assets(mgr, rel.c_str(), dst);
-        } else {
-            AAsset *a = AAssetManager_open(mgr, rel.c_str(), AASSET_MODE_STREAMING);
-            if (a != nullptr) {
-                std::ofstream f(dst, std::ios::binary);
-                char buf[16384];
-                int n;
-                while ((n = AAsset_read(a, buf, sizeof(buf))) > 0) f.write(buf, n);
-                f.close();
-                AAsset_close(a);
-                ++copied;
-            }
-        }
+        const std::string dst = out_dir + "/" + asset_path;
+        mkdir_p(dst.substr(0, dst.find_last_of('/')));
+        std::ofstream f(dst, std::ios::binary);
+        char buf[16384];
+        int n;
+        while ((n = AAsset_read(a, buf, sizeof(buf))) > 0) f.write(buf, n);
+        f.close();
+        AAsset_close(a);
+        ++copied;
     }
-    AAssetDir_close(dir);
-    __android_log_print(ANDROID_LOG_INFO, "MGSA", "extracted %d files from %s", copied, asset_dir);
+    __android_log_print(ANDROID_LOG_INFO, "MGSA", "extracted %d/%d asset files",
+                        copied, kAssetFileCount);
 }
 
 void *guest_main(void *) {
@@ -152,7 +160,7 @@ void *guest_main(void *) {
     struct stat st{};
     if (stat(marker.c_str(), &st) != 0) {
         __android_log_print(ANDROID_LOG_INFO, "MGSA", "extracting assets to %s", files.c_str());
-        extract_assets(g_app.app->activity->assetManager, "extract", files);
+        extract_assets(g_app.app->activity->assetManager, files);
         __android_log_print(ANDROID_LOG_INFO, "MGSA", "asset extraction done");
     } else {
         __android_log_print(ANDROID_LOG_INFO, "MGSA", "game data already present");
@@ -206,26 +214,38 @@ void render(ANativeWindow *window) {
 
     ANativeWindow_Buffer buf;
     if (ANativeWindow_lock(window, &buf, nullptr) != 0) return;
-    const int copy_w = fw < buf.width ? fw : buf.width;
-    const int copy_h = fh < buf.height ? fh : buf.height;
+    // Scale the 480x272 guest frame to fill the whole surface (nearest-neighbor),
+    // preserving aspect ratio with letterboxing so the UI isn't stretched.
+    const int dw = buf.width, dh = buf.height;
+    const float scale = (static_cast<float>(dw) / fw < static_cast<float>(dh) / fh)
+                            ? static_cast<float>(dw) / fw : static_cast<float>(dh) / fh;
+    const int out_w = static_cast<int>(fw * scale);
+    const int out_h = static_cast<int>(fh * scale);
+    const int off_x = (dw - out_w) / 2;
+    const int off_y = (dh - out_h) / 2;
     static int lockshots = 0;
     if (lockshots++ < 3)
-        __android_log_print(ANDROID_LOG_INFO, "MGSA", "lock ok w=%d h=%d fmt=%d stride=%d bits=%p copy=%dx%d",
-                            buf.width, buf.height, buf.format, buf.stride, buf.bits, copy_w, copy_h);
+        __android_log_print(ANDROID_LOG_INFO, "MGSA", "lock w=%d h=%d fmt=%d scale=%.2f out=%dx%d off=%d,%d",
+                            dw, dh, buf.format, scale, out_w, out_h, off_x, off_y);
+    const auto sample = [&](int sx, int sy) -> const std::uint8_t* {
+        return frame.data() + (static_cast<std::size_t>(sy) * fw + sx) * 4u;
+    };
     if (buf.format == WINDOW_FORMAT_RGBA_8888) {
-        for (int y = 0; y < copy_h; ++y) {
-            std::uint8_t *dst = static_cast<std::uint8_t *>(buf.bits) + y * buf.stride * 4u;
-            const std::uint8_t *src = frame.data() + static_cast<std::size_t>(y) * fw * 4u;
-            std::memcpy(dst, src, static_cast<std::size_t>(copy_w) * 4u);
+        for (int y = 0; y < out_h; ++y) {
+            const int sy = y * fh / out_h;
+            std::uint8_t *dst = static_cast<std::uint8_t *>(buf.bits) + (y + off_y) * buf.stride * 4u + off_x * 4u;
+            for (int x = 0; x < out_w; ++x) {
+                const std::uint8_t *src = sample(x * fw / out_w, sy);
+                dst[x*4+0] = src[0]; dst[x*4+1] = src[1]; dst[x*4+2] = src[2]; dst[x*4+3] = 0xFFu;
+            }
         }
     } else if (buf.format == WINDOW_FORMAT_RGB_565) {
-        // Pixel 9a hands us an RGB565 surface. Convert each RGBA pixel to 5-6-5.
-        for (int y = 0; y < copy_h; ++y) {
-            std::uint16_t *dst = static_cast<std::uint16_t *>(buf.bits) + y * buf.stride;
-            const std::uint8_t *src = frame.data() + static_cast<std::size_t>(y) * fw * 4u;
-            for (int x = 0; x < copy_w; ++x) {
-                const std::uint8_t r = src[x*4+0], g = src[x*4+1], b = src[x*4+2];
-                dst[x] = static_cast<std::uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        for (int y = 0; y < out_h; ++y) {
+            const int sy = y * fh / out_h;
+            std::uint16_t *dst = static_cast<std::uint16_t *>(buf.bits) + (y + off_y) * buf.stride + off_x;
+            for (int x = 0; x < out_w; ++x) {
+                const std::uint8_t *src = sample(x * fw / out_w, sy);
+                dst[x] = static_cast<std::uint16_t>(((src[0] >> 3) << 11) | ((src[1] >> 2) << 5) | (src[2] >> 3));
             }
         }
     }

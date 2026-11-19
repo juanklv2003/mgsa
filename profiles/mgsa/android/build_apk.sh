@@ -25,7 +25,7 @@ android_jar="$platform/android.jar"
 
 work="$here/build/apk"
 rm -rf "$work"
-mkdir -p "$work/classes" "$work/dex" "$work/lib/arm64-v8a" "$work/assets"
+mkdir -p "$work/classes" "$work/dex" "$work/lib/arm64-v8a" "$work/assets" "$work/res"
 
 echo "compiling NativeActivity Java"
 javac -nowarn --release 11 -classpath "$android_jar" -d "$work/classes" \
@@ -38,7 +38,7 @@ while IFS= read -r -d '' f; do class_files+=("$f"); done < <(find "$work/classes
 
 echo "staging native library and resources"
 cp "$so" "$work/lib/arm64-v8a/libmgsa.so"
-cp -r "$here/res/values" "$work/res/values" 2>/dev/null || true
+cp -r "$here"/res/* "$work/res/" 2>/dev/null || true
 if [[ -n "$game_root" && -d "$game_root" ]]; then
     echo "staging game data"
     mkdir -p "$work/assets/extract"
@@ -48,10 +48,16 @@ fi
 echo "building unsigned APK"
 (
     cd "$work"
-    aapt2 compile -o compiled.flata res/values/strings.xml
-    aapt2 link -o app-res.apk -I "$android_jar" --manifest "$here/AndroidManifest.xml" \
-        --java classes --min-sdk-version 29 --target-sdk-version 34 \
-        compiled.flata
+    # aapt2.exe is a Win32 binary: it needs backslash paths on Windows hosts.
+    work_win="$(cygpath -w "$work" 2>/dev/null || echo "$work")"
+    res_str="$work_win\\res"
+    flata="$work_win\\compiled.flata"
+    appres="$work_win\\app-res.apk"
+    java_win="$work_win\\classes"
+    aapt2 compile --dir "$res_str" -o "$flata"
+    aapt2 link -o "$appres" -I "$android_jar" --manifest "$here/AndroidManifest.xml" \
+        --java "$java_win" --min-sdk-version 29 --target-sdk-version 34 \
+        "$flata"
     javac -nowarn --release 11 -classpath "$android_jar" -d classes \
         classes/io/github/juanklv2003/mgsa/R.java 2>/dev/null || true
     # Re-dex including R
