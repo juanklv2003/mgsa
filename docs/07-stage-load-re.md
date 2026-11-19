@@ -175,3 +175,26 @@ NOT send (or a branch after a query result) in that chain.
 Status: architecture fully understood, blocker localized to engine command
 selection. No further dynamic probes planned until there is a specific hypothesis
 about which command/branch is missing.
+
+## Final entry (2026-11-19) — stop dynamic probing
+
+Followed the caller chain as far as dynamic tracing allows (runs 85-87). The
+`0x08879F28`/`0x08879EF0` pair I suspected was the command selector is NOT: trace
+showed its callers are `ra=0x09FE11xx` (sound.prx, base 0x09FE0000) and its `a0`
+arguments are binary arrays (`0x098402A5`, patterns of `0x06 0x18`) — it is a
+data-copy helper in the sound system, not stage-load logic. `0x08879844` (command
+decoder) is never entered in frame 36.
+
+Every dynamic probe this session corrected the previous interpretation rather than
+converging on the gate. Root cause of that: without understanding the game's data
+formats (the `scenerio.gcx` script, the `_zar` member layout, the mgp_stage API
+hash→name mapping), reading the assembly chains is guesswork and each chain turns
+out to belong to a different subsystem. Continuing to trace blind has negative
+returns.
+
+**Honest conclusion**: the engine requests all stage commands with plausible
+returns; the reason it never proceeds to load `title.prx` remains unidentified.
+Further progress requires either (a) decoding the game's script/data formats
+first, or (b) a reference emulator trace of the same frame as an oracle (explicitly
+out of scope per project constraints). All trace code reverted; host clean;
+journal committed up to 26751f0.
