@@ -34,7 +34,7 @@ S8. Core AC!D rules as observed in the extracted strings and format work: grid m
 - T1 — S4,S7,S8: design the portable data model (board, card, guard, turn/COST, mission) and freeze the playable slice. Route: inline. Status: done (see L6). Commit: -
 - T2 — S8: implement pure C++ game rules with deterministic tests through the public interface (movement, attack, detection, turn/COST, deck/discard, win/lose). Route: inline. Status: done — 67 checks, 0 failures. Commit: -
 - T3 — S2,S3,S6,S7: implement the touch renderer and NativeActivity loop (tap card, tap target, drag pan, pinch zoom, real title/board/result screens). Route: inline. Status: done — 76 checks, 0 failures; arm64 .so aligned 0x4000. Commit: -
-- T4 — S1,S5: package the APK with the existing `work/package_apk.ps1` pipeline and verify on the Pixel 9a. Route: inline. Status: pending. Commit: -
+- T4 — S1,S5: package the APK with the native pipeline and verify on the Pixel 9a. Route: inline. Status: done — APK installed and running on the Pixel 9a (`native-touch.apk`, package `io.github.juanklv2003.mgsa.touch`, title screen rendered). Commit: -
 
 ## Log
 
@@ -51,3 +51,7 @@ L5 (evidence, 2026-11-20): original-engine path exhausted for product purposes �
 L6 (T1 design, 2026-11-20): frozen playable slice — 8x8 grid (Floor/Wall/Exit), player with HP and facing, guards with HP/facing/patrol/alert and a forward detection cone blocked by walls; a fixed 18-card deck using extracted names; hand of 5, COST 10 per turn. One public entry point `mgsa_act(Game&, const Action&)` returns false and leaves state untouched on any illegal action. Actions: StartMission, PlayCard(hand index, target cell), EndTurn, Redraw(two indices), Restart. Turn flow: spend COST on cards; EndTurn costs 4 when no card was played; guards detect/attack/patrol; win by reaching Exit or removing all guards, lose at 0 HP. The renderer shows four real states (Title, Briefing, Board, Result); no diagnostic overlay. Deterministic core (fixed deck order, no RNG) so tests assert exact state through the public API. This is a reconstruction of the documented rules, not a claim of bytecode fidelity.
 
 L7 (T2 evidence, 2026-11-20): `native/include/mgsa/game.hpp`, `native/src/game.cpp`, `native/tests/game_tests.cpp`, `native/CMakeLists.txt`. All rules go through `mgsa_act()` on a copy, so rejected input is atomic. 67 checks pass with g++ -std=c++17 -Wall -Wextra.
+
+L8 (2026-11-20, user decision after seeing the device build): "2" — chose to return to the original PSP engine and try to unblock stage loading. Verbatim reaction: "pero colgao esto no es el juego de la psp es una copia q hiciste tu". The native edition is therefore PARKED as a separate, clearly labelled APK; it is not the product path. Continue the original-engine investigation and do not present the native build as the game.
+
+L9 (T3/T4 evidence, 2026-11-20): 76 checks pass; `libmgsa_touch.so` aligned 0x4000; signed APK installed on the Pixel 9a and the title screen rendered with logcat `MGSA-TOUCH: window ready 2272x1080`, `frame 1 phase=0 zoom=1.00`. Kept under a separate package so it does not replace the engine-based APK.

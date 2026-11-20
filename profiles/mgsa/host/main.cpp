@@ -592,6 +592,24 @@ void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     // Charging a period per caller instead makes five consumers fast-forward the guest's clock five
     // times faster than the work it is doing, and every timeout in the game expires early.
     ++g_host.vblank_count;
+    // Diagnostic: kjfs open() consumes a completed mount (state 2 -> 0) and parses the archive.
+    // The engine mounts the title stage but never issues that open, leaving state pinned at 2.
+    // Force the consume once to test whether that is the exact gate.
+    {
+        static const bool consume = std::getenv("MGSA_CONSUME_MOUNT") != nullptr;
+        if (consume && g_host.vblank_count == 38u && g_host.runtime != nullptr) {
+            for (const auto &module : g_host.modules) {
+                if (module.name != "KCEJ_FS") continue;
+                const std::uint32_t state = module.base + 0xCCD4u + 0x78u;
+                if (g_host.runtime->memory().load32(state) == 2u) {
+                    g_host.runtime->memory().store32(state, 0u);
+                    std::cout << "[mount-exp] consumed title mount at frame " << g_host.vblank_count
+                              << "\n" << std::flush;
+                }
+                break;
+            }
+        }
+    }
     dump_kjfs_state();
     dump_kjfs_root();
     // Rasterize the submitted display lists into EDRAM at frame boundary.
@@ -3520,12 +3538,26 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
                           << std::flush;
             }
         }
-        // Falsified experiment (docs/07, hypothesis 5, run61): mgp_stage+0x197C branches on
-        // out[0] == 1, but answering "media present" changes only the frame count (516 -> 520)
-        // and never makes the title stage load. Keep the original zero answer.
+        // SCE_PR_GETDEV (0x02425818): the 4-byte input is a pointer to SceDevInf, which the
+        // kernel fills. Returning success without writing it makes the guest read stale stack
+        // memory. Structure from PSPSDK pspiofilemgr_devctl.h (maxClusters, freeClusters,
+        // maxSectors, sectorSize, sectorCount). Report the card as inserted consistently.
         if (command == 0x02025806u && out_ptr != 0u && out_len >= 4u &&
             runtime.memory().contains(out_ptr, 4u)) {
-            runtime.memory().store32(out_ptr, 0u);
+            runtime.memory().store32(out_ptr, 1u);
+        }
+        if (command == 0x02425818u && in_ptr != 0u && in_len >= 4u &&
+            runtime.memory().contains(in_ptr, 4u)) {
+            const std::uint32_t info = runtime.memory().load32(in_ptr);
+            if (runtime.memory().contains(info, 20u)) {
+                runtime.memory().store32(info + 0u, 100000u);
+                runtime.memory().store32(info + 4u, 100000u);
+                runtime.memory().store32(info + 8u, 100000u);
+                runtime.memory().store32(info + 12u, 512u);
+                runtime.memory().store32(info + 16u, 64u);
+                if (g_host.vblank_count < 40u)
+                    std::cout << "[devctl] GETDEV filled " << hex32(info) << "\n" << std::flush;
+            }
         }
         ctx.gpr[2] = 0u;
     });
@@ -4094,6 +4126,23 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
 
     ++g_host.page_dispatches[pc >> 12u];
     ++g_host.return_sites[ctx.gpr[31]];
+
+    // AOT chaining hides local jumps from this hook, but function entries still arrive here.
+    // Trace every entry into the engine's decision region around the title transition.
+    {
+        static const bool engine_trace = std::getenv("MGSA_ENGINE_TRACE") != nullptr;
+        const bool in_region = pc == 0x0887A348u || pc == 0x0887BD7Cu;
+        if (engine_trace && in_region && g_host.vblank_count >= 34u &&
+            g_host.vblank_count <= 38u) {
+            static int shown = 0;
+            if (shown++ < 200) {
+                std::cout << "[engine] frame=" << g_host.vblank_count << " pc=" << hex32(pc)
+                          << " ra=" << hex32(ctx.gpr[31]) << " a0=" << hex32(ctx.gpr[4])
+                          << " a1=" << hex32(ctx.gpr[5]) << " a2=" << hex32(ctx.gpr[6])
+                          << " a3=" << hex32(ctx.gpr[7]) << "\n" << std::flush;
+            }
+        }
+    }
 
     // Temporary: a stall inside interpreted module code produces no output, so report progress
     // from the dispatcher while the wait is being identified.

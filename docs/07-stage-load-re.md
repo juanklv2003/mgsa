@@ -222,7 +222,48 @@ The Android app is fully working (assets extracted, guest boots, native menu vis
 on Pixel 9a), but the GAME itself never loads a stage. Host clean, no experiments
 committed.
 
-## Session 2026-11-20 (late) — memory-stick devctl gate CONFIRMED
+## Session 2026-11-20 (second pass) — kjfs mount protocol decoded, more gates falsified
+
+New evidence from runs 97-102:
+
+- `kjfs::mount` (+0x1094) decoded: `wait(mount_sema)`; if `state[+0x78] != 0`
+  skip everything; else `state=1`, `strncpy(name, +0x7C, 128)`,
+  `sceKernelStartThread(preseek_tid)`, `signal`. It never parses the archive.
+- `kjfs::preseek` (+0x1154) decoded: `open(name)` via internal `0x634`,
+  `sceIoLseek(fd,0,0)`, `wait(mount_sema)`, `state=2`, exit.
+- `kjfs::open` (+0x634) decoded: it **only parses the archive when `state[+0x78] == 2`**,
+  then resets the state to 0 and resolves the virtual path. Therefore the required
+  transition sequence is `mount(name) -> open(virtual_path)`. In the logs the engine
+  calls `mount("stage/title/data.cnf")` once at frame 36 but never issues the
+  follow-up `open`; kjfs stays pinned at `stage_state=2` for the remaining 480 frames.
+  The only frame-36 `open` is the sound thread opening `e001system.psq`.
+- FALSIFIED: forcing `stage_state 2 -> 0` at frame 38 (`MGSA_CONSUME_MOUNT`, run98)
+  changes nothing (74 frames, no title files). The engine does not poll that word.
+- FALSIFIED: `sceIoDevctl("ms0:", 0x02425818)` is `SCE_PR_GETDEV` (PSPSDK
+  `pspiofilemgr_devctl.h`): the 4-byte input is a pointer to a 20-byte `SceDevInf`.
+  The HLE previously returned success without filling it — a manufactured result.
+  Now filled correctly plus `mscmhc0:` inserted=1 (run100); still no title load.
+  Keep the fix because it is correct HLE behaviour, not because it is the gate.
+- FALSIFIED: thread exit — `user_main` calls `sceKernelExitDeleteThread` at frame 0
+  by design after creating `Main`; not a premature death.
+- FALSIFIED: guest clock — `sceKernelGetSystemTimeWide` uses the advancing virtual time.
+- Engine hash trace (`MGSA_ENGINE_TRACE`, run102) at frame 36: the dispatcher at
+  `0x0887A348` calls hash `0x00DD258E` exactly once (the mount) and then polls
+  `0x00542B2D` (42x), `0x006B237D` (38x) and `0x00C74F97` (24x) repeatedly.
+  `mgp_stage+0x20E0` (one of the polled handlers) always returns 0. The repeated
+  `0x08879EF0`/`0x08879F28` entries are sound-module data-copy helpers, already
+  falsified in an earlier session.
+- `sceCtrlReadBufferPositive` is called 258 times and a START press reaches the guest
+  (run92 `[press] frame 62 buttons=0x00000008`), with a byte-identical run result.
+
+Net: the engine requests the mount, receives success, then keeps polling three
+methods whose answers never indicate "stage ready". The missing transition is on
+the engine side of that poll loop, not in kjfs I/O and not in input delivery.
+
+## Session 2026-11-20 (earlier pass) — devctl branch identified, later FALSIFIED as the gate
+
+The heading below said CONFIRMED at the time; the second pass above falsified it. Kept as the
+record of how the lead was found.
 
 Two earlier readings were corrected with measured evidence:
 
