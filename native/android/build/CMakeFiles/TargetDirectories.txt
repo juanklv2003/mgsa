@@ -1,3 +1,0 @@
-C:/Users/Gloria/Documents/mgsa/native/android/build/CMakeFiles/mgsa_touch.dir
-C:/Users/Gloria/Documents/mgsa/native/android/build/CMakeFiles/edit_cache.dir
-C:/Users/Gloria/Documents/mgsa/native/android/build/CMakeFiles/rebuild_cache.dir

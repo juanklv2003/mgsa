@@ -1,0 +1,5 @@
+# Native build outputs and signed APKs are artifacts, not source.
+android/build/
+*.apk
+*.so
+*.o

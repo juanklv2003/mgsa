@@ -33,7 +33,7 @@ S8. Core AC!D rules as observed in the extracted strings and format work: grid m
 
 - T1 — S4,S7,S8: design the portable data model (board, card, guard, turn/COST, mission) and freeze the playable slice. Route: inline. Status: done (see L6). Commit: -
 - T2 — S8: implement pure C++ game rules with deterministic tests through the public interface (movement, attack, detection, turn/COST, deck/discard, win/lose). Route: inline. Status: done — 67 checks, 0 failures. Commit: -
-- T3 — S2,S3,S6,S7: implement the touch renderer and NativeActivity loop (tap card, tap target, drag pan, pinch zoom, real title/board/result screens). Route: inline. Status: pending. Commit: -
+- T3 — S2,S3,S6,S7: implement the touch renderer and NativeActivity loop (tap card, tap target, drag pan, pinch zoom, real title/board/result screens). Route: inline. Status: done — 76 checks, 0 failures; arm64 .so aligned 0x4000. Commit: -
 - T4 — S1,S5: package the APK with the existing `work/package_apk.ps1` pipeline and verify on the Pixel 9a. Route: inline. Status: pending. Commit: -
 
 ## Log
