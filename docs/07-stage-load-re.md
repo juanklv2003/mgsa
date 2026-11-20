@@ -222,6 +222,45 @@ The Android app is fully working (assets extracted, guest boots, native menu vis
 on Pixel 9a), but the GAME itself never loads a stage. Host clean, no experiments
 committed.
 
+## Hash-addressed API table (runtime dump, run106, frame 37)
+
+The dispatcher at `0x0887A348` is a binary search over 20 eight-byte entries
+`{hash u32, handler u32}` at guest address `0x09FEDEC0` (mgp_stage data base).
+This is the authoritative map, obtained by reading guest RAM, not inferred:
+
+| hash | handler | meaning |
+|---|---|---|
+| 0x00118631 | 0x08809408 | engine |
+| 0x002986E9 | 0x09FDF1B8 | mgp_stage+0x1B8 (language/impose) |
+| 0x0034CC13 | 0x088083EC | engine |
+| 0x003A9224 | 0x09FE1090 | mgp_stage+0x1090 |
+| 0x004E557B | 0x088174EC | engine |
+| 0x00542B2D | 0x09FE0F58 | mgp_stage+0x0F58 (polled 42x/frame) |
+| 0x006B237D | 0x09FE10E0 | mgp_stage+0x10E0 (polled 38x/frame) |
+| 0x006F7D4D | 0x09FDF070 | mgp_stage+0x70 |
+| 0x00BC0B7D | 0x08847B68 | engine |
+| 0x00C74F97 | 0x09FE1110 | mgp_stage+0x1110 (polled 24x/frame) |
+| 0x00D42B14 | 0x09FE186C | mgp_stage+0x186C |
+| 0x00DD258E | 0x09FDF12C | **mgp_stage+0x12C = mount_current_stage** |
+| 0x00DE07C0 | 0x09FDF090 | mgp_stage+0x90 |
+| 0x00E5C433 | 0x0880930C | engine |
+| 0x00E79927 | 0x08808448 | engine |
+| 0x00EA0E2C | 0x0881747C | engine |
+| 0x00EFB2D7 | 0x09FE0E9C | mgp_stage+0x0E9C |
+| 0x00F02E23 | 0x08863F08 | engine |
+| 0x00F7AF2C | 0x09FE05E0 | mgp_stage+0x05E0 |
+| 0x00FB834B | 0x0881E970 | engine |
+
+This confirms the mount hash and corrects the earlier offsets: the three methods
+the engine keeps polling are `+0x0F58`, `+0x10E0` and `+0x1110`, all inside
+mgp_stage (base 0x09FDF000). `+0x20E0` in older notes was a transcription error
+for `+0x10E0`. The engine calls the mount exactly once at frame 36 and then
+polls those three methods on every subsequent frame; none ever reports "ready".
+
+Note on the disassembly tool: `jal` targets such as `0x75C2C` in mgp_stage are
+BOOT.BIN-relative offsets (base 0x08804000), i.e. `0x08879C2C`, not module
+offsets. `0x08879F28`/`0x08879EF0` are sound-system data-copy helpers.
+
 ## Session 2026-11-20 (second pass) — kjfs mount protocol decoded, more gates falsified
 
 New evidence from runs 97-102:

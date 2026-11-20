@@ -592,6 +592,23 @@ void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     // Charging a period per caller instead makes five consumers fast-forward the guest's clock five
     // times faster than the work it is doing, and every timeout in the game expires early.
     ++g_host.vblank_count;
+    // Dump the hash-addressed API registration table: the engine stores (hash, handler) pairs
+    // around 0x09A01E20. Locating the polled hashes gives their exact handler addresses.
+    {
+        static const bool hash_dump = std::getenv("MGSA_HASH_TABLE") != nullptr;
+        static bool dumped = false;
+        if (hash_dump && !dumped && g_host.vblank_count == 37u && g_host.runtime != nullptr) {
+            dumped = true;
+            auto &memory = g_host.runtime->memory();
+            const std::uint32_t table = 0x09FEDEC0u;
+            for (int i = 0; i < 20; ++i) {
+                const std::uint32_t hash = memory.load32(table + i * 8u);
+                const std::uint32_t handler = memory.load32(table + i * 8u + 4u);
+                std::cout << "[hash] entry " << std::dec << i << " hash=" << hex32(hash)
+                          << " handler=" << hex32(handler) << "\n" << std::flush;
+            }
+        }
+    }
     // Diagnostic: kjfs open() consumes a completed mount (state 2 -> 0) and parses the archive.
     // The engine mounts the title stage but never issues that open, leaving state pinned at 2.
     // Force the consume once to test whether that is the exact gate.
