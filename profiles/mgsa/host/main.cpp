@@ -529,6 +529,62 @@ void wake_expired_delays();
 
 static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t start,
     std::uint32_t fb_base, std::uint32_t width, std::uint32_t height);
+
+// kjfs keeps its archive and stage state in its own .data at fixed module-relative offsets. The
+// stage loader is asynchronous: mount() returns before a single byte is read, so "waiting for the
+// worker" and "stuck forever" are indistinguishable from the call log alone. Dump those words when
+// they move and only when they move, so one run shows which field stops advancing.
+void dump_kjfs_state() {
+    static const bool enabled = std::getenv("MGSA_KJFS_STATE") != nullptr;
+    if (!enabled) return;
+    const LoadedModule *kjfs = nullptr;
+    for (const auto &module : g_host.modules) {
+        if (module.name == "KCEJ_FS") { kjfs = &module; break; }
+    }
+    if (kjfs == nullptr || g_host.runtime == nullptr) return;
+    const std::uint32_t archive = kjfs->base + 0xCC00u;
+    const std::uint32_t stage = kjfs->base + 0xCCD4u;
+    auto &memory = g_host.runtime->memory();
+    static std::array<std::uint32_t, 9> previous{};
+    const std::array<std::uint32_t, 9> now{
+        memory.load32(archive + 0x0Cu),  // request size
+        memory.load32(archive + 0x20u),  // destination buffer
+        memory.load32(archive + 0x24u),  // bytes filled
+        memory.load32(archive + 0x30u),  // archive fd the worker reads
+        memory.load32(archive + 0x34u),  // requests pending
+        memory.load32(archive + 0x38u),  // requests completed
+        memory.load32(archive + 0x48u),  // lookup state
+        memory.load32(stage + 0x74u),    // mounted stage fd
+        memory.load32(stage + 0x78u)};   // 0 idle, 1 mounting, 2 mounted
+    if (now == previous) return;
+    previous = now;
+    std::cout << "[kjfs-state] frame=" << g_host.vblank_count
+              << " size=" << now[0] << " buf=" << hex32(now[1]) << " filled=" << now[2]
+              << " fd=" << now[3] << " pending=" << now[4] << " done=" << now[5]
+              << " lookup=" << now[6] << " stage_fd=" << now[7] << " stage_state=" << now[8]
+              << "\n" << std::flush;
+}
+
+// Around the title mount, show whether kjfs rebuilt its virtual directory. For the boot stage
+// `open(".../data.cnf")` reports count=5 and the five virtual files are then opened normally;
+// after mounting `title` no virtual file is requested, and this says whether the root changed.
+void dump_kjfs_root() {
+    static const bool enabled = std::getenv("MGSA_KJFS_ROOT") != nullptr;
+    if (!enabled || g_host.vblank_count < 34u || g_host.vblank_count > 46u) return;
+    const LoadedModule *kjfs = nullptr;
+    for (const auto &module : g_host.modules) {
+        if (module.name == "KCEJ_FS") { kjfs = &module; break; }
+    }
+    if (kjfs == nullptr || g_host.runtime == nullptr) return;
+    auto &memory = g_host.runtime->memory();
+    const std::uint32_t root = kjfs->base + 0xCDD0u;
+    std::cout << "[kjfs-root] frame=" << g_host.vblank_count;
+    for (int i = 0; i < 12; ++i) {
+        std::cout << " +" << std::dec << (i * 4) << "=" << hex32(memory.load32(root + i * 4u));
+    }
+    std::cout << "\n" << std::flush;
+}
+
 void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     // A boundary is crossed only when guest time has actually reached it. The wait binding parks
     // its caller until `next_vblank_us`, so the scheduler is what moves the clock here: one frame
@@ -536,6 +592,8 @@ void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     // Charging a period per caller instead makes five consumers fast-forward the guest's clock five
     // times faster than the work it is doing, and every timeout in the game expires early.
     ++g_host.vblank_count;
+    dump_kjfs_state();
+    dump_kjfs_root();
     // Rasterize the submitted display lists into EDRAM at frame boundary.
     {
         const std::uint32_t fb = g_host.frame_buffer != 0u ? g_host.frame_buffer : 0x04000000u;
@@ -1058,8 +1116,14 @@ struct StubState {
     std::uint64_t calls{};
 };
 
+// Imports that only answer through the logging stub, tracked apart from real bindings. A dump
+// that cannot tell "we implemented this" from "we answer 0 to everything" hides the difference
+// that matters: a stubbed import silently returns success to a caller that branches on it.
+std::set<std::string> g_stubbed_imports;
+
 void install_stub(Runtime &runtime, const psprecomp::PspImport &import) {
     g_host.bound_imports.insert(import.library + ":" + hex32(import.nid));
+    g_stubbed_imports.insert(import.library + ":" + hex32(import.nid));
     auto state = std::make_shared<StubState>();
     state->label = import.library + "::" + runtime.nids().resolve(import.library, import.nid).value_or(hex32(import.nid));
     runtime.register_hle(import.library, import.nid, [state, library = import.library, nid = import.nid](Runtime &, AllegrexContext &ctx) {
@@ -2158,6 +2222,19 @@ static std::uint32_t sample_clut4(const psprecomp::GuestMemory &memory,
 
 static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t start,
                               std::uint32_t fb_base, std::uint32_t width, std::uint32_t height) {
+    // MGSA_GE_DUMP=<n> dumps the command stream of the first n display lists. The rasterizer's
+    // gaps are otherwise invisible: a black screen looks the same whether the guest drew nothing,
+    // drew black, or drew something this host silently skipped. This prints what the guest sent.
+    static int ge_dump_budget = -1;
+    if (ge_dump_budget < 0) {
+        const char *dump_env = std::getenv("MGSA_GE_DUMP");
+        ge_dump_budget = dump_env != nullptr ? std::atoi(dump_env) : 0;
+    }
+    const bool dumping = ge_dump_budget > 0;
+    if (dumping) {
+        --ge_dump_budget;
+        std::cout << "[ge] ---- list start=" << hex32(start) << " fb=" << hex32(fb_base) << "\n";
+    }
     std::uint32_t pc = start;
     std::array<std::uint32_t, 8> call_stack{};
     std::size_t call_depth = 0u;
@@ -2185,6 +2262,10 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
         const std::uint32_t word = memory.aot_load32(pc);
         const std::uint32_t command = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
+        if (dumping) {
+            std::cout << "[ge]   " << hex32(pc) << "  " << ge_command_name(command)
+                      << " 0x" << hex32(data) << "\n";
+        }
         pc += 4u;
         const auto relative = [&](std::uint32_t d) {
             return (offset_address + (base_extended | (d & 0x00FFFFFFu))) & 0x0FFFFFFFu;
@@ -2281,6 +2362,25 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
                     const std::uint32_t x_hi = (x0 < x1) ? x1 : x0;
                     const std::uint32_t y_lo = (y0 < y1) ? y0 : y1;
                     const std::uint32_t y_hi = (y0 < y1) ? y1 : y0;
+                    // MGSA_SPRITE_DBG prints the decoded geometry of the first sprites. A draw that
+                    // decodes to a zero-area quad writes no pixel, which is indistinguishable from
+                    // an unimplemented primitive unless the numbers are printed.
+                    static const bool sprite_dbg = std::getenv("MGSA_SPRITE_DBG") != nullptr;
+                    static int sprite_dbg_left = 24;
+                    if (sprite_dbg && sprite_dbg_left-- > 0) {
+                        std::cout << "[sprite] fb=" << hex32(fb_base) << " wh=" << width << "x" << height
+                                  << " count=" << count << " vtype=" << hex32(vertex_type)
+                                  << " vaddr=" << hex32(vertex_address) << " stride=" << vertex_stride
+                                  << " pos=" << position_type << " tex=" << texcoord_type
+                                  << " col=" << color_type << " nrm=" << normal_type
+                                  << " xy0=" << x0 << "," << y0 << " xy1=" << x1 << "," << y1
+                                  << " lo=" << x_lo << "," << y_lo << " hi=" << x_hi << "," << y_hi
+                                  << " color=" << hex32(color)
+                                  << " texen=" << texture_enabled << " texfmt=" << texture_format
+                                  << " texaddr=" << hex32(texture_address) << " clut=" << hex32(clut_address)
+                                  << " area=" << ((x_hi > x_lo && y_hi > y_lo) ? "yes" : "ZERO")
+                                  << "\n" << std::flush;
+                    }
                     if (texture_enabled && texture_format == 4u && texture_address != 0u) {
                         for (std::uint32_t y = y_lo; y < y_hi && y < height; ++y) {
                             for (std::uint32_t x = x_lo; x < x_hi && x < width; ++x) {
@@ -3420,9 +3520,9 @@ void register_real_hle(Runtime &runtime, std::vector<std::string> &bound) {
                           << std::flush;
             }
         }
-        // EXPERIMENT: mgp_stage polls mscmhc0: 0x02025806 every frame and treats out[0] == 1 as
-        // "media present". Writing it answers the only question this host can answer about a
-        // memory stick it does not have, and shows whether the poll gates the game.
+        // Falsified experiment (docs/07, hypothesis 5, run61): mgp_stage+0x197C branches on
+        // out[0] == 1, but answering "media present" changes only the frame count (516 -> 520)
+        // and never makes the title stage load. Keep the original zero answer.
         if (command == 0x02025806u && out_ptr != 0u && out_len >= 4u &&
             runtime.memory().contains(out_ptr, 4u)) {
             runtime.memory().store32(out_ptr, 0u);

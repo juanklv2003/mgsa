@@ -221,3 +221,31 @@ static AOT reading has not converged either. No emulator oracle per constraint.
 The Android app is fully working (assets extracted, guest boots, native menu visible
 on Pixel 9a), but the GAME itself never loads a stage. Host clean, no experiments
 committed.
+
+## Session 2026-11-20 (late) — memory-stick devctl gate CONFIRMED
+
+Two earlier readings were corrected with measured evidence:
+
+1. The engine does NOT stall after the title mount. run89/92: 516 frames,
+   412793 dispatches, 258 `sceCtrlReadBufferPositive` calls and 2816 draws.
+   START presses produce a byte-identical run. `Main` spins in the frame limiter
+   at 0x0887BF38 with no blocked thread.
+2. Every draw is a full-screen sprite (0,0)-(480,272), vtype 0x0080011C,
+   pos=2 (s16), stride=12, color=0x00000000, texturing off (run94,
+   `MGSA_SPRITE_DBG`). EDRAM staying at 0/524288 words is therefore CORRECT:
+   the guest clears to black and draws nothing else. The rasterizer is not the gate.
+
+**Confirmed gate (run95):** `mgp_stage+0x197C` calls
+`sceIoDevctl("mscmhc0:", 0x02025806, out, 4)`. The guest then does
+`xori v0,v0,1; sltiu v1,v0,1; beql v1,zero,0x1BFC` at +0x1990..+0x1998:
+it only enters the stage-load path when `out[0] == 1`. The HLE handler wrote
+`0` ("no media"), so every stage transition after boot silently took the
+no-memory-stick branch. Boot's own stage (`init`) is auto-mounted by kjfs and
+never goes through this call, which is why init loaded and title did not.
+Changed the answer to `store32(out_ptr, 1u)`. With that single change the guest
+takes the load branch and a NEW devctl appears at `mgp_stage+0x1A00`:
+`0x02425818` on `"ms0:"` with a 4-byte input (never reached before).
+
+run96 (full run, --max 600000) is in progress to determine whether the title
+archive is then read and title.prx loaded. The "SYSTEM MENU" seen on the Pixel
+is `host/ui.cpp`, a host-owned overlay, not game output.
