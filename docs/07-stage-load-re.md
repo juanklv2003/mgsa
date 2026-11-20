@@ -198,3 +198,26 @@ Further progress requires either (a) decoding the game's script/data formats
 first, or (b) a reference emulator trace of the same frame as an oracle (explicitly
 out of scope per project constraints). All trace code reverted; host clean;
 journal committed up to 26751f0.
+
+## Session 2026-11-20 — static gate RE, no convergence
+
+User asked to pursue the gate via static reading of the engine command-selection
+chain. Attempts (all falsified):
+- Traced all AOT dispatches in the decision region 0x08877xxx-0x0887Axxx in frame 36
+  (run86, 500 entries). Observed sceImpose/GetSystemParamInt calls, devctl returning
+  -3/-1, and the engine calling its own internal helpers, but no single decision
+  point that skipped the title load.
+- Read `0x08879400`: it checks a task group at `0x089B4B00` (direct.log showed task
+  groups at 0x089B4B50+). It is task bookkeeping, not the load decision.
+- The Ghidra decomp's config flags: `0x0890C428=0x3021`, `0x0890C42C=0x02A02021`
+  (bit 0x200000 set, which the decomp's PMF branch tests). Cleared that bit in a
+  53s test (run89): baseline unchanged (516 frames). NOT the gate.
+- The Ghidra function FUN_000fd10c (mapped 0x0891108C) that sets `+0x50=1` is
+  NEVER executed in frame 36 (run88: 0 dispatches in 0x08911000-0x08911600).
+
+Honest status: ~20 probes this session, every concrete lead falsified. The gate
+remains unidentified. Both dynamic tracing and data-format decoding are exhausted;
+static AOT reading has not converged either. No emulator oracle per constraint.
+The Android app is fully working (assets extracted, guest boots, native menu visible
+on Pixel 9a), but the GAME itself never loads a stage. Host clean, no experiments
+committed.
