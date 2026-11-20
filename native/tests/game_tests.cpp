@@ -1,4 +1,5 @@
 #include "mgsa/game.hpp"
+#include "mgsa/render.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -162,6 +163,32 @@ void test_win_and_lose() {
     CHECK(loss.outcome == mgsa::Outcome::Lose);
 }
 
+void test_render_and_hit_testing() {
+    mgsa::Game game = fresh();
+    mgsa::Canvas canvas;
+    mgsa::canvas_resize(canvas, mgsa::kViewWidth, mgsa::kViewHeight);
+    mgsa::ViewState view;
+    mgsa::render_game(canvas, game, view);
+
+    bool varied = false;
+    const std::uint32_t first = canvas.pixels[0] | (canvas.pixels[1] << 8) | (canvas.pixels[2] << 16);
+    for (std::size_t i = 0; i + 3 < canvas.pixels.size(); i += 4) {
+        const std::uint32_t color = canvas.pixels[i] | (canvas.pixels[i + 1] << 8) |
+                                    (canvas.pixels[i + 2] << 16);
+        if (color != first) { varied = true; break; }
+    }
+    CHECK(varied);  // a real board was drawn, not a blank frame
+
+    CHECK(mgsa::hit_test(game, view, 40, 240).kind == mgsa::Hit::Kind::Card);
+    CHECK(mgsa::hit_test(game, view, 40, 240).index == 0);
+    CHECK(mgsa::hit_test(game, view, 350, 180).kind == mgsa::Hit::Kind::EndTurn);
+    CHECK(mgsa::hit_test(game, view, 350, 210).kind == mgsa::Hit::Kind::Menu);
+    CHECK(mgsa::hit_test(game, view, 32, 28).kind == mgsa::Hit::Kind::Cell);
+    CHECK(mgsa::hit_test(game, view, 32, 28).x == 0);
+    view.menu_open = true;
+    CHECK(mgsa::hit_test(game, view, 200, 150).kind == mgsa::Hit::Kind::MenuResume);
+}
+
 void test_restart() {
     mgsa::Game game = fresh();
     mgsa::Action restart{};
@@ -181,6 +208,7 @@ int main() {
     test_knock_and_redraw();
     test_turn_cost_and_detection();
     test_win_and_lose();
+    test_render_and_hit_testing();
     test_restart();
     std::printf("mgsa game tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

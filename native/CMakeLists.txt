@@ -4,7 +4,7 @@ project(mgsa_native LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(mgsa_game STATIC src/game.cpp)
+add_library(mgsa_game STATIC src/game.cpp src/render.cpp)
 target_include_directories(mgsa_game PUBLIC include)
 
 enable_testing()

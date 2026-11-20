@@ -1,0 +1,6 @@
+# ninja log v7
+34	1513	8168988004650510	CMakeFiles/mgsa_touch.dir/C_/Users/Gloria/Documents/mgsa/native/src/game.cpp.o	c4f63e55b64f1a58
+77	1689	8168988005075332	CMakeFiles/mgsa_touch.dir/C_/Users/Gloria/Documents/mgsa/work/android-ndk-r27c/sources/android/native_app_glue/android_native_app_glue.c.o	31133d886a9b682f
+45	8342	8168988004760428	CMakeFiles/mgsa_touch.dir/C_/Users/Gloria/Documents/mgsa/native/src/render.cpp.o	62d45ae22712fc86
+46	1990	8168988302144176	CMakeFiles/mgsa_touch.dir/jni/android_main.cpp.o	8f0ddcef11e7380a
+1991	2227	8168988321605750	libmgsa_touch.so	af5893c9fd44b545

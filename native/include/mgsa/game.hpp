@@ -66,7 +66,7 @@ struct Game {
 };
 
 struct Action {
-    enum class Kind : std::uint8_t { StartMission, PlayCard, EndTurn, Redraw, Restart };
+    enum class Kind : std::uint8_t { Briefing, StartMission, PlayCard, EndTurn, Redraw, Restart };
     Kind kind;
     int a;   // hand index (PlayCard, Redraw first index)
     int b;   // Redraw second index

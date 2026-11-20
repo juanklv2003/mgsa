@@ -322,6 +322,10 @@ bool mgsa_act(Game &game, const Action &action) {
     Game trial = game;
     bool ok = false;
     switch (action.kind) {
+        case Action::Kind::Briefing:
+            ok = trial.phase == Phase::Title ? (trial.phase = Phase::Briefing, true)
+                                             : fail("Already in a mission.");
+            break;
         case Action::Kind::StartMission:
             ok = start_mission(trial);
             break;
