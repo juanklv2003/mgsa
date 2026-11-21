@@ -299,6 +299,27 @@ Net: the engine requests the mount, receives success, then keeps polling three
 methods whose answers never indicate "stage ready". The missing transition is on
 the engine side of that poll loop, not in kjfs I/O and not in input delivery.
 
+## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
+
+Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the
+follow-up `kjfs::open()` that parses the `_zar` and publishes its virtual directory. Attempts to
+perform that open with the guest's own code:
+
+1. `runtime.invoke_import("kjfs", 0x93E9297F, ctx)` with a synthetic context — returns fd=0 because
+   the forwarder sets `ctx.pc` but the dispatcher runs the real thread's context, not ours.
+2. Queue a one-instruction MIPS shim (`addiu a1,1; jr kjfs::open`) as an `IntrHandler` — the shim
+   DID execute guest code (confirmed by a real `[kjfs] open ->` line) but `kjfs::open` wrote to
+   Main's stack and crashed at 0x0000003C, because an interrupt frame has no private stack.
+3. Create a real guest thread with its own stack, `$gp=kjfs.gp`, entry=shim, `ra=kThreadExitStub`,
+   path passed as start argument — still crashes at 0x0000002C: a module export must return through
+   `kModuleReturnSentinel`, not the thread exit stub; entering it without a `FrameKind::Export`
+   frame leaves the frame stack inconsistent.
+
+Conclusion: the mechanism to synthesise a guest call exists but needs a full module-call frame,
+not just a stack. This was not pursued further because it risks corrupting guest state. The real
+engine still never issues the follow-up open, and the stage gate remains open. Reverted all
+force-open code; base run restored (92 frames, no crash).
+
 ## Session 2026-11-21 (continued) — hash table re-based, poll return values
 
 The hash table was relocated by the module rebase, but searching guest RAM by content
