@@ -29,6 +29,13 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+
+// Temporary AOT instrumentation: called from generated_unit_0029.cpp at decoder entry 0x08879844.
+// Records the source pointer and output slots so the stage-command bytecode format can be
+// recovered offline. Enabled by MGSA_DECODER_TRACE.
+extern "C" void mgsa_decoder_hook(unsigned int src, unsigned int a1, unsigned int a2,
+                                  unsigned int ra, unsigned int);
+std::uint8_t g_mgsa_decoder_trace_enabled = 0u;
 #include <vector>
 
 namespace psprecomp {
@@ -470,6 +477,34 @@ struct Host {
 };
 
 Host g_host{};
+
+extern "C" void mgsa_decoder_hook(unsigned int src, unsigned int a1, unsigned int a2,
+                                  unsigned int ra, unsigned int) {
+    if (g_mgsa_decoder_trace_enabled == 0u) return;
+    static int shown = 0;
+    if (shown++ >= 80) return;
+    auto &memory = g_host.runtime->memory();
+    // One-shot: dump the whole title script buffer once we see the 0x0887BD94 call site.
+    static bool script_dumped = false;
+    if (ra == 0x0887BD94u && !script_dumped) {
+        script_dumped = true;
+        std::cout << "[script-dump] src=" << std::hex << src << ":";
+        for (int i = 0; i < 1024; ++i) {
+            if (!memory.contains(src + i, 1u)) break;
+            std::cout << " " << std::hex << static_cast<int>(memory.aot_load8(src + i));
+        }
+        std::cout << std::dec << "\n" << std::flush;
+    }
+    std::cout << "[dec] src=" << std::hex << src << " a1=" << a1 << " a2=" << a2
+              << " ra=" << ra;
+    if (memory.contains(a1, 4u)) std::cout << " out=" << std::hex << memory.load32(a1);
+    std::cout << " :" << std::dec;
+    for (int i = 0; i < 32; ++i) {
+        if (!memory.contains(src + i, 1u)) break;
+        std::cout << " " << std::hex << static_cast<int>(memory.aot_load8(src + i));
+    }
+    std::cout << std::dec << "\n" << std::flush;
+}
 
 // The synthetic frame stack of the thread that is running now. Module calls and interrupt entries
 // push a frame there; the sentinel pops it. Keying by thread keeps a thread that blocked inside
@@ -4156,6 +4191,18 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
     ++g_host.page_dispatches[pc >> 12u];
     ++g_host.return_sites[ctx.gpr[31]];
 
+    // Track the script pointer each time the engine enters 0x0887BD7C(process_script).
+    {
+        static const bool script_flow = std::getenv("MGSA_SCRIPT_FLOW") != nullptr;
+        if (script_flow && pc == 0x0887BD7Cu && g_host.vblank_count >= 34u &&
+            g_host.vblank_count <= 40u) {
+            static int shown = 0;
+            if (shown++ < 60)
+                std::cout << "[flow] frame=" << g_host.vblank_count << " a0=" << hex32(ctx.gpr[4])
+                          << " ra=" << hex32(ctx.gpr[31]) << "\n" << std::flush;
+        }
+    }
+
     // AOT chaining hides local jumps from this hook, but function entries still arrive here.
     // The engine dispatches mgp_stage methods by hash through one thunk. Capture the requested
     // hash at the dispatcher (0x0887A348, a1=hash) and the handler's return value at the thunk's
@@ -4408,6 +4455,7 @@ bool on_unsupported(Runtime &runtime, AllegrexContext &, std::uint32_t pc, std::
 // mgsa_main is the platform-neutral entry: the desktop main() and the
 // Android NativeActivity both call it. CLI args select paths and max dispatches.
 int mgsa_main(int argc, char **argv) {
+    g_mgsa_decoder_trace_enabled = std::getenv("MGSA_DECODER_TRACE") != nullptr ? 1u : 0u;
     std::filesystem::path elf_path = "extract/PSP_GAME/SYSDIR/BOOT.BIN";
     std::uint64_t max_dispatches = 20'000'000u;
     for (int i = 1; i < argc; ++i) {

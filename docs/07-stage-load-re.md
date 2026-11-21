@@ -299,6 +299,33 @@ Net: the engine requests the mount, receives success, then keeps polling three
 methods whose answers never indicate "stage ready". The missing transition is on
 the engine side of that poll loop, not in kjfs I/O and not in input delivery.
 
+## Session 2026-11-21 (script bytecode decoding) — FIRST REAL FORMAT DATA
+
+Instrumented the AOT decoder entry `0x08879844` by patching the gitignored
+`generated_unit_0029.cpp` with a C hook (`mgsa_decoder_hook`, run127-129). This gave the
+first actual stage-script bytes the engine reads.
+
+**`0x08879844` is a byte-stream token decoder, not a generic copy helper.** Given
+`(src, out1, out2)`, it reads a token from `src`, writes its value to `out1`, and advances.
+Return sites show it is used by many callers (`0x08879D34` 57x, `0x0887BD94` 4x, others).
+The engine's decision loop at `0x0887BD94` compares the returned token to 7 and 14.
+
+**Title script bytes at guest `0x09842C6E`** (1024-byte dump in run129):
+- `0x73` = string-literal token: `73 07 06 'title' 00 00` and `73 ... 'stdch.h_end' 00`.
+- `0x6d`, `0x6a`, `0x69`, `0x6c` = references into the string table, e.g.
+  `6d c9 2b 8 04 06 ...`, `69 c9 2b 8 04 06 ...`.
+- Short control tokens `37 12 10 00`, `37 14 11 00`, `73 04 00 00`, `73 0b 00 00`.
+- The token `title` sits at script offset `0xE2`.
+
+**`MGSA_SCRIPT_FLOW` (run130)** traced the pointer passed to `process_script(0x0887BD7C)`:
+29 blocks are processed in frame 36, all returning via `0x0887A1B0`. The engine reaches
+`0x09842D06` (offset `0x98` of the title script) but **never** the `title` token block at
+`0x09842D50` (offset `0xE2`). This is the closest view yet of where the script walk stops.
+
+Next: determine why the walk stops at `0x09842D06` — decode the `0x6d` control token that
+precedes `title` and find what condition advances the script pointer past it. The AOT patch
+lives only in gitignored generated code; main.cpp's hook is env-gated (`MGSA_DECODER_TRACE`).
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the
