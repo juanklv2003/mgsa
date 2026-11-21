@@ -494,7 +494,12 @@ constexpr std::uint64_t kFramePeriodUs = 16'683u;
 // supported RAM size, so no loaded image or guest allocation can ever own it. The same sentinel
 // ends a module_start, an export call and an interrupt handler, because all three are guest code
 // this harness enters directly.
-constexpr std::uint32_t kModuleReturnSentinel = 0x09FFF000u;
+// A synthetic PC at the very top of the backed guest RAM. Runtime is given extra backing memory
+// when the decrypted system modules are installed as real code, so the arena has to reach higher
+// than the stock 32 MiB image; the sentinel stays above every allocation. GuestMemory grows with
+// the runtime, so this address is always inside the backed window.
+constexpr std::uint32_t kModuleReturnSentinel = 0x0A7FF000u;
+constexpr std::uint32_t kGuestRamLimit = 0x0A800000u;
 constexpr std::size_t kNoModule = static_cast<std::size_t>(-1);
 
 // Enters the next queued VBLANK handler through a synthetic frame: the handler is guest code in a
@@ -654,7 +659,7 @@ void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     if (g_host.vblank_count % 60u == 0u) {
         const psprecomp::GuestMemory &memory = runtime.memory();
         std::uint64_t hash = 1469598103934665603ull;
-        for (std::uint32_t address = 0x08800000u; address < 0x0A000000u; address += 256u) {
+        for (std::uint32_t address = 0x08800000u; address < kGuestRamLimit; address += 256u) {
             if (!memory.contains(address, 4u)) continue;
             hash ^= memory.aot_load32(address);
             hash *= 1099511628211ull;
@@ -1566,7 +1571,7 @@ Runtime::HleFunction make_prx_export_forwarder(std::string library, std::uint32_
         {
             static std::map<std::pair<std::string, std::uint32_t>, unsigned> seen;
             auto &count = seen[{library, nid}];
-            if (count < 3u && ctx.gpr[31] != 0x09FFF000u) {
+            if (count < 3u && ctx.gpr[31] != kModuleReturnSentinel) {
                 ++count;
                 std::cout << "[call] frame=" << g_host.vblank_count << " " << g_host.modules[index].name
                           << "::" << hex32(nid) << " caller=" << hex32(ctx.gpr[31]) << "\n"
@@ -4432,7 +4437,9 @@ int mgsa_main(int argc, char **argv) {
 
     try {
         const auto elf = psprecomp::Elf32Image::from_file(elf_path);
-        const std::uint32_t ram = elf.required_ram_size();
+        // The decrypted system modules occupy real guest RAM that the substituted stubs did not.
+        // Back enough memory to hold them plus the sentinel at the top of the window.
+        const std::uint32_t ram = 64u * 1024u * 1024u;
         Runtime runtime(ram);
         g_host.runtime = &runtime;
 
@@ -4456,7 +4463,7 @@ int mgsa_main(int argc, char **argv) {
         }
         g_host.arena_next = (image_end + 0xFFFFu) & ~0xFFFFu;
         // PSP user RAM ends at 0x0A000000; never hand the guest an address the runtime cannot back.
-        g_host.arena_end = std::min(kLoadBase + ram - 0x100000u, 0x0A000000u - 0x10000u);
+        g_host.arena_end = std::min(kLoadBase + ram - 0x100000u, kModuleReturnSentinel - 0x10000u);
         std::cout << "arena " << hex32(g_host.arena_next) << " .. " << hex32(g_host.arena_end) << " ("
                   << (g_host.free_bytes() / (1024u * 1024u)) << " MiB)\n";
 

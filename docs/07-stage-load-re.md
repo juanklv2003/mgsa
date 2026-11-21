@@ -299,6 +299,35 @@ Net: the engine requests the mount, receives success, then keeps polling three
 methods whose answers never indicate "stage ready". The missing transition is on
 the engine side of that poll loop, not in kjfs I/O and not in input delivery.
 
+## Session 2026-11-21 — encrypted system modules decrypted from the user's ISO
+
+The user supplied the SHA-1 of their retail dump:
+`2d2e5604297ac922f4a117952315ea91348af174` for
+`Metal Gear Acid (Europe) (En,Fr,De,Es,It).iso`. The local ISO matches byte-for-byte
+(324,534,272 bytes), confirming the exact release.
+
+Nine `~PSP` modules in `USRDIR/modules/` (audiocodec, ifhandle, memab, mpegbase,
+pspnet_adhoc_auth, rinit, sc_sascore, usbpspcm, videocodec) were decrypted **from that
+ISO** with the public KIRK global keys using `pspdecrypt` (github.com/John-K/pspdecrypt,
+cloned to gitignored `work/pspdecrypt`, built with the local gcc). Each decrypted stream
+was gunzipped where needed and validated as ELF32 `ET_SCE_PPURELEXEC` (0xFFA0), MIPS (0x08).
+Installed over `extract/` with the encrypted originals backed up to
+`work/encrypted_backup/` (all paths gitignored — game data never enters Git).
+
+**Result (run110):** all nine load as real guest code with exports and relocations;
+`sc_sascore`/codec/MPEG imports are now executed, not stubbed. `mgp_stage` also loads
+as real code again. To fit them, the host now backs 64 MiB of guest RAM and moves the
+synthetic module-return sentinel to `0x0A7FF000` (it is only a PC value compared by the
+host, never guest memory), extending the arena to `0x0A7EF000`. All earlier hard-coded
+`0x09FFF000`/`0x0A000000` comparisons were replaced with the named constants.
+
+**The stage gate is unchanged:** `fd=318 reads=0` — the title archive is still never read.
+Decrypting the modules fixed the audio/video layer, not the load gate, as expected.
+
+**Important consequence:** `mgp_stage` now loads at base `0x0A067000` instead of
+`0x09FDF000`. Every module-relative offset and the hash table address in the sections above
+are stale until re-derived against the new base.
+
 ## Session 2026-11-20 (earlier pass) — devctl branch identified, later FALSIFIED as the gate
 
 The heading below said CONFIRMED at the time; the second pass above falsified it. Kept as the
