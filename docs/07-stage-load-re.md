@@ -334,6 +334,32 @@ the branch that selects sound (`stdch.h_end`, visited) versus `title` (skipped).
 branch requires tracing the caller that extracts sub-block pointers — beyond what this hook
 can see. AOT instrumentation restored; base run unchanged.
 
+**Event system traced (run134-139)** — this CORRECTS the "title block not visited" theory:
+- Event handler table at guest `0x0893DF58`, 6 entries:
+  `0x37C884->0x088080D8`, `0x82BC9->0x08808224` (title), `0x6592A7->0x088081D8`,
+  `0x6BB005->0x08808288`, `0x3BD490->0x08816494`, `0x3822C7->0x088082D0`.
+- The title event (`0x82BC9`) IS handled: `0x08808224` runs in frame 36 (run136), dispatching
+  15 mgp_stage hashes (`0xC74F97` 11x, `0x542B2D` 10x, `0x6B237D` 7x, plus one-shots).
+- The `0x6D` token payloads ARE the event ids: `3B B2 3A 0E` -> `0x3AB23B` (stdch.h_end),
+  `C9 2B 08` -> `0x82BC9` (title). Both are looked up.
+- **Decisive (run138):** the kjfs mount stack for `stage/title/data.cnf` contains
+  `0x09842D4B` — the exact address of the second `0x6D` "title" token — and `0x00DD258E`
+  (mount_current_stage). So the FULL chain works: title token -> mount_current_stage ->
+  kjfs::mount. The mount is NOT skipped.
+- mgp_stage data_base = `0x0A075EC0` (hash table location). `*(db+0x40)=0x00BC0B7D`
+  (active event hash), `*(db+0x44)=0x08847B68` (its handler).
+- **Root cause restated precisely:** mount_current_stage calls kjfs::mount and returns 0
+  (success) synchronously. kjfs::mount only sets `stage_state=2` and starts `preseek`, which
+  opens+lseeks the `_zar` but never reads it. Parsing the archive requires a follow-up
+  `kjfs::open(virtual_path)` that the engine never issues. The kjfs root stays at the init
+  directory (`count=5`), and title.prx / e002st00_1.psq are never opened. All attempts to
+  synthesise that open from the host (synthetic ctx, interrupt shim, guest thread) failed on
+  module-frame semantics and were reverted.
+
+This is the deepest localisation reached. The remaining work is to make the guest issue the
+follow-up open with a proper module-call frame, or to find why the engine's normal post-mount
+path omits it.
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the

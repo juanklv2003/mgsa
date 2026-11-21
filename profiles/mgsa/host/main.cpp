@@ -35,7 +35,10 @@
 // recovered offline. Enabled by MGSA_DECODER_TRACE.
 extern "C" void mgsa_decoder_hook(unsigned int src, unsigned int a1, unsigned int a2,
                                   unsigned int ra, unsigned int);
+extern "C" void mgsa_evt_hook(unsigned int id, unsigned int list, unsigned int count);
 std::uint8_t g_mgsa_decoder_trace_enabled = 0u;
+std::uint8_t g_mgsa_evt_trace_enabled = 0u;
+extern std::uint8_t g_mgsa_evt_table_dumped;
 #include <vector>
 
 namespace psprecomp {
@@ -477,6 +480,43 @@ struct Host {
 };
 
 Host g_host{};
+std::uint8_t g_mgsa_evt_table_dumped = 0u;
+
+extern "C" void mgsa_evt_hook(unsigned int id, unsigned int list, unsigned int count) {
+    if (g_mgsa_evt_trace_enabled == 0u) return;
+    static int shown = 0;
+    if (shown++ >= 200) return;
+    std::cout << "[evt] frame=" << std::dec << g_host.vblank_count
+              << " id=" << std::hex << id << " list=" << list << " count=" << std::dec << count;
+    // mgp_stage state machine reads *(data_base+0x40); data_base is published in argv[0]+4.
+    auto &memory = g_host.runtime->memory();
+    // The hash table begins at data_base; found at 0x0A075EC0 by content scan (run117).
+    constexpr std::uint32_t db = 0x0A075EC0u;
+    if (memory.contains(db + 0x40u, 4u))
+        std::cout << " stage+40=" << std::hex << memory.load32(db + 0x40u);
+    if (memory.contains(db + 0x44u, 4u))
+        std::cout << " stage+44=" << std::hex << memory.load32(db + 0x44u);
+    std::cout << "\n" << std::dec << std::flush;
+    // One-shot: dump the handler table. The list node at `list` holds count at +4 and a table
+    // pointer at +8; each entry is an 8-byte (id, handler) pair.
+    if (g_mgsa_evt_table_dumped == 0u && list != 0u) {
+        auto &memory = g_host.runtime->memory();
+        if (memory.contains(list, 12u)) {
+            const std::uint32_t n = memory.load32(list + 4u);
+            const std::uint32_t table = memory.load32(list + 8u);
+            g_mgsa_evt_table_dumped = 1u;
+            std::cout << "[evt-table] list=" << std::hex << list << " n=" << std::dec << n
+                      << " table=" << std::hex << table << "\n" << std::flush;
+            if (n < 512u && memory.contains(table, n * 8u)) {
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    std::cout << "[evt-table] " << std::dec << i << " id=" << std::hex
+                              << memory.load32(table + i * 8u) << " handler="
+                              << memory.load32(table + i * 8u + 4u) << "\n" << std::flush;
+                }
+            }
+        }
+    }
+}
 
 extern "C" void mgsa_decoder_hook(unsigned int src, unsigned int a1, unsigned int a2,
                                   unsigned int ra, unsigned int) {
@@ -4201,6 +4241,38 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
     ++g_host.page_dispatches[pc >> 12u];
     ++g_host.return_sites[ctx.gpr[31]];
 
+    // The event handlers for the script events. 0x08808224 handles id 0x82BC9 (the title block);
+    // 0x088080D8 handles 0x37C884; 0x08806288 is called at the end of the title handler.
+    {
+        static const bool handler_trace = std::getenv("MGSA_HANDLER_TRACE") != nullptr;
+        if (handler_trace && g_host.vblank_count >= 35u && g_host.vblank_count <= 40u &&
+            (pc == 0x08808224u || pc == 0x08806288u || pc == 0x088080D8u)) {
+            static int shown = 0;
+            if (shown++ < 80)
+                std::cout << "[handler] frame=" << std::dec << g_host.vblank_count
+                          << " pc=" << std::hex << pc << " a0=" << ctx.gpr[4]
+                          << " a1=" << ctx.gpr[5] << " ra=" << ctx.gpr[31]
+                          << "\n" << std::dec << std::flush;
+        }
+    }
+
+    // find_event_index(list, id) at 0x0887A104 compares the requested id (gpr[4]) against a
+    // registered-handler table. If the title event's id is missing, its script block is skipped.
+    {
+        static const bool event_lookup = std::getenv("MGSA_EVENT_LOOKUP") != nullptr;
+        if (event_lookup && pc == 0x0887A104u && g_host.vblank_count >= 35u &&
+            g_host.vblank_count <= 38u) {
+            static int shown = 0;
+            if (shown++ < 120)
+                std::cout << "[evt] frame=" << std::dec << g_host.vblank_count
+                          << " id=" << std::hex << ctx.gpr[4] << " list=" << ctx.gpr[6]
+                          << " count=" << (g_host.runtime != nullptr
+                              && g_host.runtime->memory().contains(ctx.gpr[6] + 4u, 4u)
+                              ? g_host.runtime->memory().load32(ctx.gpr[6] + 4u) : 0u)
+                          << "\n" << std::dec << std::flush;
+        }
+    }
+
     // Track the script pointer each time the engine enters 0x0887BD7C(process_script).
     {
         static const bool script_flow = std::getenv("MGSA_SCRIPT_FLOW") != nullptr;
@@ -4466,6 +4538,7 @@ bool on_unsupported(Runtime &runtime, AllegrexContext &, std::uint32_t pc, std::
 // Android NativeActivity both call it. CLI args select paths and max dispatches.
 int mgsa_main(int argc, char **argv) {
     g_mgsa_decoder_trace_enabled = std::getenv("MGSA_DECODER_TRACE") != nullptr ? 1u : 0u;
+    g_mgsa_evt_trace_enabled = std::getenv("MGSA_EVENT_LOOKUP") != nullptr ? 1u : 0u;
     std::filesystem::path elf_path = "extract/PSP_GAME/SYSDIR/BOOT.BIN";
     std::uint64_t max_dispatches = 20'000'000u;
     for (int i = 1; i < argc; ++i) {
