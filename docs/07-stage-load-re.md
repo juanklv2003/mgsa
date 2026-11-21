@@ -299,6 +299,26 @@ Net: the engine requests the mount, receives success, then keeps polling three
 methods whose answers never indicate "stage ready". The missing transition is on
 the engine side of that poll loop, not in kjfs I/O and not in input delivery.
 
+## Session 2026-11-21 (continued) — hash table re-based, poll return values
+
+The hash table was relocated by the module rebase, but searching guest RAM by content
+(`MGSA_FIND_TABLE`: two adjacent known hashes `0x00542B2D`/`0x006B237D`, 8 bytes apart)
+found it at `0x0A075EC0` (run117). Every handler is exactly the old value plus
+`0x0A067000 - 0x09FDF000`, so the rebase is linear and all earlier disassembly remains
+valid: mount `0x00DD258E -> 0x0A06712C`, polls `0x00542B2D -> 0x0A068F58`,
+`0x006B237D -> 0x0A0690E0`, `0x00C74F97 -> 0x0A069110`.
+
+`MGSA_RET_TRACE` (run118) captured the return values at the engine thunk's return site
+`0x08808260`: in frame 36 all three polled methods return `v0 = 0`. Method `0x006B237D`
+also leaves `v1 = 0x089E0000`, but that is a leftover from a 64-bit helper return and the
+engine only consumes `v0`. So no polled method ever signals "ready" — consistent with the
+stage never loading.
+
+Falsified this continuation: `0x08879844` is not the scenerio command decoder called from
+the decision loop; no entries to it occur in frames 34-44. Earlier AOT reading of
+`0x0887BD94` as a script return site was wrong — it is the return from a module call.
+The engine does drain *something* in that loop, but its selector has not been identified.
+
 ## Session 2026-11-21 — encrypted system modules decrypted from the user's ISO
 
 The user supplied the SHA-1 of their retail dump:

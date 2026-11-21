@@ -597,6 +597,30 @@ void advance_vblank(Runtime &runtime, AllegrexContext &ctx) {
     // Charging a period per caller instead makes five consumers fast-forward the guest's clock five
     // times faster than the work it is doing, and every timeout in the game expires early.
     ++g_host.vblank_count;
+    // Locate the mgp_stage hash table by content: its entries are sorted, and 0x00542B2D and
+    // 0x006B237D are adjacent. Offsets from the module base moved when the decrypted modules were
+    // installed, so searching by content survives a rebase.
+    {
+        static const bool find_table = std::getenv("MGSA_FIND_TABLE") != nullptr;
+        static bool found = false;
+        if (find_table && !found && g_host.vblank_count >= 8u && g_host.runtime != nullptr) {
+            auto &memory = g_host.runtime->memory();
+            for (std::uint32_t address = 0x08800000u; address + 0x100u < kGuestRamLimit; address += 4u) {
+                if (memory.load32(address) != 0x00542B2Du) continue;
+                if (memory.load32(address + 8u) != 0x006B237Du) continue;
+                found = true;
+                const std::uint32_t table = address - 5u * 8u;  // 0x00542B2D is entry 5
+                std::cout << "[findtable] at " << hex32(table) << "\n" << std::flush;
+                for (int i = 0; i < 20; ++i) {
+                    const std::uint32_t hash = memory.load32(table + i * 8u);
+                    const std::uint32_t handler = memory.load32(table + i * 8u + 4u);
+                    std::cout << "[findtable] " << std::dec << i << " " << hex32(hash)
+                              << " -> " << hex32(handler) << "\n" << std::flush;
+                }
+                break;
+            }
+        }
+    }
     // Diagnostic: kjfs open() consumes a completed mount (state 2 -> 0) and parses the archive.
     // The engine mounts the title stage but never issues that open, leaving state pinned at 2.
     // Force the consume once to test whether that is the exact gate.
@@ -4133,6 +4157,27 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
     ++g_host.return_sites[ctx.gpr[31]];
 
     // AOT chaining hides local jumps from this hook, but function entries still arrive here.
+    // The engine dispatches mgp_stage methods by hash through one thunk. Capture the requested
+    // hash at the dispatcher (0x0887A348, a1=hash) and the handler's return value at the thunk's
+    // return site (0x08808260, v0). This shows what the three polled methods actually report.
+    {
+        static const bool ret_trace = std::getenv("MGSA_RET_TRACE") != nullptr;
+        static std::uint32_t last_hash = 0u;
+        static int shown = 0;
+        if (ret_trace && g_host.vblank_count >= 34u && g_host.vblank_count <= 44u) {
+            if (pc == 0x0887A348u) {
+                last_hash = ctx.gpr[5];
+            } else if (pc == 0x08808260u && shown < 400 &&
+                       (last_hash == 0x00542B2Du || last_hash == 0x006B237Du ||
+                        last_hash == 0x00C74F97u || last_hash == 0x00DD258Eu)) {
+                ++shown;
+                std::cout << "[ret] frame=" << g_host.vblank_count << " hash=" << hex32(last_hash)
+                          << " v0=" << hex32(ctx.gpr[2]) << " v1=" << hex32(ctx.gpr[3])
+                          << "\n" << std::flush;
+            }
+        }
+    }
+
     // Trace every entry into the engine's decision region around the title transition.
     {
         static const bool engine_trace = std::getenv("MGSA_ENGINE_TRACE") != nullptr;
