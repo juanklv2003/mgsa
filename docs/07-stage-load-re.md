@@ -326,6 +326,14 @@ Next: determine why the walk stops at `0x09842D06` — decode the `0x6d` control
 precedes `title` and find what condition advances the script pointer past it. The AOT patch
 lives only in gitignored generated code; main.cpp's hook is env-gated (`MGSA_DECODER_TRACE`).
 
+**Follow-up (run132):** instrumented the decoder hook to print any `0x6D` token it sees.
+It saw NONE. The engine's `process_script` is entered at the *sub-block* offsets (`0x0`,
+`0x13`, `0x98`), never at the `0x6D` bytes themselves. So the `0x6D` tokens are consumed by a
+different function before `process_script` is called, and this decoder hook cannot observe
+the branch that selects sound (`stdch.h_end`, visited) versus `title` (skipped). Finding that
+branch requires tracing the caller that extracts sub-block pointers — beyond what this hook
+can see. AOT instrumentation restored; base run unchanged.
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the

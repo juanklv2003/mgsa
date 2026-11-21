@@ -484,6 +484,16 @@ extern "C" void mgsa_decoder_hook(unsigned int src, unsigned int a1, unsigned in
     static int shown = 0;
     if (shown++ >= 80) return;
     auto &memory = g_host.runtime->memory();
+    // Track 0x6D token decoding: its payload decides which sub-block (sound vs title) runs.
+    if (memory.contains(src, 1u) && memory.aot_load8(src) == 0x6Du) {
+        std::cout << "[6d] frame=" << std::dec << g_host.vblank_count << " src=" << std::hex << src
+                  << " bytes:";
+        for (int i = 0; i < 20; ++i) {
+            if (!memory.contains(src + i, 1u)) break;
+            std::cout << " " << std::hex << static_cast<int>(memory.aot_load8(src + i));
+        }
+        std::cout << std::dec << "\n" << std::flush;
+    }
     // One-shot: dump the whole title script buffer once we see the 0x0887BD94 call site.
     static bool script_dumped = false;
     if (ra == 0x0887BD94u && !script_dumped) {
