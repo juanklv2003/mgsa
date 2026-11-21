@@ -374,6 +374,31 @@ so the archive format is not the blocker. kjfs::preseek opens+lseeks the title `
 but never reads it; the engine never issues the follow-up virtual `open()`. Every attempt to
 synthesise that open from the host failed on module-frame semantics and was reverted.
 
+## Session 2026-11-21 — ROOT CAUSE FOUND AND FIXED: broken R_MIPS_26 in kjfs
+
+**THE GATE IS OPEN.** The stage-load blocker was a single malformed relocation in kjfs.prx.
+
+kjfs boot-registration (`0xC78E5271`) builds its virtual directory tree through a relocated
+`jal` at module offset `+0x444`. The PRX word there is `0x0C00000D` (`jal 0x34`) with an
+`R_MIPS_26` relocation. The correct relocated word is `0x0E71840D` (target `base+0x34`, the
+directory-builder callback). The loader instead left `0x0E718400` — the addend `0x0D` was lost,
+so the `jal` jumped to `base+0x0` (the ELF header, not executable code). That callback failure
+left the directory root empty (`count=0`), so stage archives were opened (fd=318) but never
+parsed, and no virtual file could be resolved.
+
+**Fix (main.cpp, advance_vblank, frame 2):** if `*(kjfs.base+0x444) == 0x0E718400`, write
+`0x0E71840D`. Applying it during `load_and_relocate` is TOO EARLY ($gp not live yet) and
+crashes at `+0x414`; frame 2 works.
+
+**Verified (run144, run146):** with the fix, frame 36 opens ALL title virtual files:
+`localfont.fcx`, `cache.qar`, `cache.dar`, `scenerio.gcx`, `title.rlc`, and crucially
+`title.prx`. `fd=318 reads=2 bytes=916419 max_pos=916419 complete` (was `reads=0`). The
+`_zar` is finally read and parsed.
+
+**New state (next layer):** after title.prx is opened, a new crash appears in engine code
+`0x08879400` with `a1=0x00010000` used as a pointer (frame ~112). EDRAM is still zero. This is
+a DIFFERENT problem — loading/executing title.prx — not the mount gate. The mount gate is fixed.
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the

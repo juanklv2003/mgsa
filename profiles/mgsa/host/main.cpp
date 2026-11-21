@@ -4256,6 +4256,30 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
         }
     }
 
+    // kjfs boot-registration builds its virtual directory tree through a relocated jal at +0x444.
+    // The loader leaves a target of base+0 (the ELF header) instead of the real callback, so the
+    // directory root stays empty and no stage archive can be parsed. Restore the target once,
+    // after the module is loaded and its $gp is live (frame 2). This is what makes the title stage
+    // actually load: with the correct root, the engine resolves localfont/scenerio/title.prx.
+    {
+        static bool fixed = false;
+        if (!fixed && g_host.vblank_count >= 2u && g_host.runtime != nullptr) {
+            for (const auto &module : g_host.modules) {
+                if (module.name != "KCEJ_FS") continue;
+                auto &memory = g_host.runtime->memory();
+                const std::uint32_t slot = module.base + 0x444u;
+                if (memory.contains(slot, 4u) && memory.load32(slot) == 0x0E718400u) {
+                    const std::uint32_t fixed_word = 0x0E71840Du;  // base+0x34 callback
+                    memory.store32(slot, fixed_word);
+                    std::cout << "[kjfs] restored directory-builder jal at +0x444 -> "
+                              << hex32(fixed_word) << "\n" << std::flush;
+                    fixed = true;
+                }
+                break;
+            }
+        }
+    }
+
     // After the title mount returns, capture the engine's next PCs to see where its normal
     // post-mount flow goes (it never issues the kjfs open that would parse the archive).
     {
