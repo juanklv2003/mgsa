@@ -360,6 +360,20 @@ This is the deepest localisation reached. The remaining work is to make the gues
 follow-up open with a proper module-call frame, or to find why the engine's normal post-mount
 path omits it.
 
+**Post-mount flow traced (run141, MGSA_POST_MOUNT):** armed on the mount's thunk return, the
+engine's next 40 dispatched PCs are captured. It CONTINUES processing script events after the
+mount: handler `0x08808224` processes block `0x09842D60`, extracts hash `0xF02E23`, dispatches it
+(handler `0x08863F08` returns 1), then processes more events with hashes `0xEFB2D7`, `0x8D775B`.
+The engine does NOT stop at the mount — it keeps running events. So the mount is not where the
+flow dies; the engine simply never reaches a kjfs `open()` after it. The `0x08879C2C` reads that
+produce values like `0xE09262C1` are ordinary memory loads, not PSP error codes (corrected an
+earlier misreading).
+
+The `_zar` files of init and title are structurally identical (6-entry TOC, same member names),
+so the archive format is not the blocker. kjfs::preseek opens+lseeks the title `_zar` (fd=318)
+but never reads it; the engine never issues the follow-up virtual `open()`. Every attempt to
+synthesise that open from the host failed on module-frame semantics and was reverted.
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the

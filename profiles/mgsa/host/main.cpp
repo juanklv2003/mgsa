@@ -4256,6 +4256,27 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
         }
     }
 
+    // After the title mount returns, capture the engine's next PCs to see where its normal
+    // post-mount flow goes (it never issues the kjfs open that would parse the archive).
+    {
+        static const bool post_mount = std::getenv("MGSA_POST_MOUNT") != nullptr;
+        static bool armed = false;
+        static int steps = 0;
+        // The mount's hash is 0x00DD258E; its thunk return is pc=0x08808260 (same site as
+        // MGSA_RET_TRACE, which is proven to fire). Arm right after that return in frame 36.
+        static std::uint32_t pm_hash = 0u;
+        if (pc == 0x0887A348u) pm_hash = ctx.gpr[5];
+        if (post_mount && g_host.vblank_count == 36u) {
+            if (!armed && pc == 0x08808260u && pm_hash == 0x00DD258Eu) { armed = true; steps = 0; }
+            else if (armed && steps < 40) {
+                ++steps;
+                std::cout << "[post] step=" << std::dec << steps << " frame=" << g_host.vblank_count
+                          << " pc=" << std::hex << pc << " a0=" << ctx.gpr[4]
+                          << " v0=" << ctx.gpr[2] << "\n" << std::dec << std::flush;
+            }
+        }
+    }
+
     // find_event_index(list, id) at 0x0887A104 compares the requested id (gpr[4]) against a
     // registered-handler table. If the title event's id is missing, its script block is skipped.
     {
