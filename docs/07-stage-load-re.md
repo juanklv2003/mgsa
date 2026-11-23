@@ -405,6 +405,23 @@ a DIFFERENT problem — loading/executing title.prx — not the mount gate. The 
 buffer and some field resolves to `0x10000`, producing an out-of-RAM access. That is the next
 layer: parsing the newly-loaded title data with an incorrect HLE-provided value.
 
+**A/B test (run149):** restoring the encrypted originals (stubs) and keeping the gate fix still
+crashes at `0x10000`. So the audio modules are NOT the cause — it is engine data parsing.
+
+**Disassembly of the crashing function (MIPS, BOOT.BIN 0x75400 = guest 0x08879400):**
+- `0x08879400` loops over 4112-byte entries indexed by global `0x089B7B80` (0/1).
+- For each entry it calls `0x088752B0`, which at `0x7552F4` loads `a1 = [entry+4100]` and uses it
+  as the destination of a copy (`a0=len, a1=dest, a3=src`). The entry's `+4100` is initialized
+  at `0x754EC` (`sw v1=a3+2052, 4100(a3)`) as a valid in-struct pointer.
+- The bad value `0x10000` therefore comes from a corrupted entry base, not from the global.
+
+**Runtime trace (run154):** filtered the normal frame-limiter calls to `0x08879400`
+(`a0=0xffffffff,a1=0,a2=0xf0000`) and found ONE anomalous call at frame 68:
+`a0=0x099E1000, a2=0x09264500, a3=0xA40`. `0x099E1000` is a GE display-list address (seen as
+`[enq] list=0x499E1000`), and at that moment `sound::0x531B15D1` is entered with `a0=0x01000000`.
+So a display-list pointer and a 16 MB size value are being passed where a data buffer is expected —
+a type confusion in the engine's post-load object handling, one layer beyond the mount gate.
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the
