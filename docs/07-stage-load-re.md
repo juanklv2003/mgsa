@@ -456,6 +456,21 @@ The runtime write-watch confirmed the sequence: `sw 0` to the table-index global
 was stale (the runtime warns hot registers may be stale on unwind) — the real fault is the
 unrelocated `lui a1,0x0001` store target.
 
+**FIXED (run163, crash eliminated):** the low-address crash is fixed by aliasing low addresses
+into unused high RAM in `work/tools/Yakumo/src/guest_memory.cpp` (gitignored local Yakumo fork):
+`contains()`/`resolve()` now map `0x00010000..0x00020000` to `0x0A800000..0x0A810000`. The AOT
+fast path declines low addresses (negative `ram_offset_of`), so the store goes through `resolve()`
+and lands in the alias. After this fix: `exit=0`, NO crash, 246 frames, 117 GE lists, 1265 draws.
+
+**title.prx NOW LOADS (run163):** `[module] loaded sce_lbn0x1ca80_size0x24fb1 'mgp_stage'
+uid=4106 base=0x0A183000 relocations=3816 imports=14` — the title stage's own module is loaded
+and executing. The full chain works: mount gate fixed -> all 7 title files opened -> title.prx
+read (fd 319, 151 KB) -> loaded as a module. EDRAM is still zero, so rendering the title screen is
+the next layer, but the engine now runs the actual title-stage code.
+
+Note: the runtime patch lives in gitignored `work/tools/Yakumo`. Preserve it — a clean checkout
+loses it. It is a host compatibility shim (rebasing unrelocated low `lui` addresses), not game data.
+
 Next fix to try: extending GuestMemory's `contains`/`resolve` to back the low `0x00010000`
 scratch region, OR patching the AOT-generated code (the `lui` is folded into AOT logic, so patching
 guest RAM for BOOT.BIN — which is AOT-compiled, not fetched from memory — has no effect; verified
