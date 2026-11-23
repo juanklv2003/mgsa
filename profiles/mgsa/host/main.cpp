@@ -4256,16 +4256,14 @@ void on_pre_dispatch(Runtime &runtime, AllegrexContext &ctx, std::uint32_t pc, s
         }
     }
 
-    // Investigate the title.prx load crash: 0x08879400 indexes a 4112-byte table by a global
-    // count at 0x089B7B80; if that count is a negative sentinel it becomes 0x10000 and goes OOB.
+    // Investigate the title.prx load crash at 0x08879400. Log all four args at entry.
     {
         static const bool slot_trace = std::getenv("MGSA_SLOT_TRACE") != nullptr;
         if (slot_trace && pc == 0x08879400u && g_host.runtime != nullptr) {
-            auto &memory = g_host.runtime->memory();
-            const std::uint32_t slot = 0x089B7B80u;
             std::cout << "[slot] frame=" << std::dec << g_host.vblank_count
-                      << " count=" << std::hex << memory.load32(slot)
-                      << " a1=" << ctx.gpr[5] << " a0=" << ctx.gpr[4]
+                      << " a0=" << std::hex << ctx.gpr[4] << " a1=" << ctx.gpr[5]
+                      << " a2=" << ctx.gpr[6] << " a3=" << ctx.gpr[7]
+                      << " v0=" << ctx.gpr[2]
                       << "\n" << std::dec << std::flush;
         }
     }
