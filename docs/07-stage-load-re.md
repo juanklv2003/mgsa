@@ -422,13 +422,17 @@ crashes at `0x10000`. So the audio modules are NOT the cause — it is engine da
 So a display-list pointer and a 16 MB size value are being passed where a data buffer is expected —
 a type confusion in the engine's post-load object handling, one layer beyond the mount gate.
 
-**Origin of 0x01000000 (run155/156):** the value is built in `generated_unit_0000.cpp` at
-`L_088061A8` — a big-endian u32 decoder (`b3<<24 | b2<<16 | b1<<8 | b0`) reading 4 bytes from a
-guest buffer. It reads bytes `01 00 00 00` as `0x01000000`. If those bytes are actually a
-little-endian `0x00000001` field, this is an endianness mismatch in stage data the guest parses —
-not a host HLE value. That is the deepest point reached: the engine is parsing stage data with a
-value that becomes an out-of-range pointer. Fixing it likely requires supplying the data in the
-byte order the engine expects (or patching the decoder), a separate task from the mount gate.
+**CORRECTION:** the "big-endian decoder at L_088061A8" was a misreading. `L_####` labels in the
+generated AOT are internal block labels and DO NOT correspond to guest MIPS addresses. The real
+MIPS at guest `0x088061A8` (BOOT.BIN `0x861A8`) is `addu s2,a1,zero`, a function prologue — not a
+byte-order decoder. The `<<24` sequence seen in generated_unit_0000.cpp belongs to a different
+guest function. The AOT hook placed there never fired (all calls are chained directly), confirming
+the interpretation was wrong. The origin of `0x01000000` remains unidentified; this is the same
+pattern that has corrected every deep lead in this investigation. Do not trust AOT labels as
+addresses — use `work/dis.py` on BOOT.BIN with segments `0:0x80:0x139D74,0x139D80:0x139E00:0x7DBC`.
+
+The verified state stands: mount gate fixed (4568d81), all 7 title files open including title.prx,
+_ zar fully read, and a later crash at `0x08879400` with `0x10000` that is NOT the audio modules.
 
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 

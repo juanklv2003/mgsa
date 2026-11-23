@@ -38,6 +38,7 @@ extern "C" void mgsa_decoder_hook(unsigned int src, unsigned int a1, unsigned in
 extern "C" void mgsa_evt_hook(unsigned int id, unsigned int list, unsigned int count);
 extern "C" void mgsa_init_hook(unsigned int a3, unsigned int a1, unsigned int a0);
 extern "C" void mgsa_79400_hook(unsigned int, unsigned int, unsigned int, unsigned int);
+extern "C" void mgsa_be_hook(unsigned int, unsigned int);
 std::uint8_t g_mgsa_decoder_trace_enabled = 0u;
 std::uint8_t g_mgsa_evt_trace_enabled = 0u;
 extern std::uint8_t g_mgsa_evt_table_dumped;
@@ -483,6 +484,20 @@ struct Host {
 
 Host g_host{};
 std::uint8_t g_mgsa_evt_table_dumped = 0u;
+
+extern "C" void mgsa_be_hook(unsigned int addr, unsigned int pc) {
+    if (std::getenv("MGSA_BE_TRACE") == nullptr) return;
+    static int shown = 0;
+    if (shown++ >= 40) return;
+    auto &memory = g_host.runtime->memory();
+    std::cout << "[be] frame=" << std::dec << g_host.vblank_count << " pc=" << std::hex << pc
+              << " addr=" << addr << " bytes:";
+    for (int i = 0; i < 4; ++i) {
+        if (!memory.contains(addr + i, 1u)) { std::cout << " ?"; continue; }
+        std::cout << " " << std::hex << static_cast<int>(memory.aot_load8(addr + i));
+    }
+    std::cout << "\n" << std::dec << std::flush;
+}
 
 extern "C" void mgsa_79400_hook(unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3) {
     if (std::getenv("MGSA_INIT_TRACE") == nullptr) return;
