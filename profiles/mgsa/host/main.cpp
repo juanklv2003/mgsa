@@ -2405,7 +2405,17 @@ static void rasterize_ge_list(psprecomp::GuestMemory &memory, std::uint32_t star
         const char *dump_env = std::getenv("MGSA_GE_DUMP");
         ge_dump_budget = dump_env != nullptr ? std::atoi(dump_env) : 0;
     }
-    const bool dumping = ge_dump_budget > 0;
+    // Delay dumping until the title stage draws (frame >= 100), so the budget is spent on real
+    // title display lists instead of the init stage's empty clear list.
+    static const bool ge_dump_late = std::getenv("MGSA_GE_DUMP_LATE") != nullptr;
+    const bool dumping = ge_dump_budget > 0 && (!ge_dump_late || g_host.vblank_count >= 100u);
+    // Summary of primitive/alpha state per list once the title stage is running.
+    if (std::getenv("MGSA_GE_STATS") != nullptr) {
+        static int shown = 0;
+        if (shown++ < 8) {
+            std::cout << "[ge-stats] list start=" << hex32(start) << "\n" << std::flush;
+        }
+    }
     if (dumping) {
         --ge_dump_budget;
         std::cout << "[ge] ---- list start=" << hex32(start) << " fb=" << hex32(fb_base) << "\n";
