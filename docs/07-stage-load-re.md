@@ -399,6 +399,12 @@ crashes at `+0x414`; frame 2 works.
 `0x08879400` with `a1=0x00010000` used as a pointer (frame ~112). EDRAM is still zero. This is
 a DIFFERENT problem — loading/executing title.prx — not the mount gate. The mount gate is fixed.
 
+`MGSA_SLOT_TRACE` (run147) falsified the "negative slot sentinel" theory: the global count at
+`0x089B7B80` oscillates 0/1 normally through frame 112. The crash follows a zlib inflate
+(`0x461C7724`, frame 110, dest `0x08B44E10`); the engine then reads a freshly-decompressed
+buffer and some field resolves to `0x10000`, producing an out-of-RAM access. That is the next
+layer: parsing the newly-loaded title data with an incorrect HLE-provided value.
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the
