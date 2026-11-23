@@ -434,6 +434,35 @@ addresses — use `work/dis.py` on BOOT.BIN with segments `0:0x80:0x139D74,0x139
 The verified state stands: mount gate fixed (4568d81), all 7 title files open including title.prx,
 _ zar fully read, and a later crash at `0x08879400` with `0x10000` that is NOT the audio modules.
 
+**ROOT CAUSE OF THE POST-LOAD CRASH (MIPS disassembly + runtime write-watch, run161):**
+`0x08879400` is BOOT.BIN `0x75400`; it calls `0x0887521C` (`0x7521C`), which contains:
+```
+7522C: lui a1, 0x0001     -> a1 = 0x00010000
+7523C: sw  v1, 0(a1)      -> store to 0x00010000   <-- OUT OF RAM
+75274: lui a1, 0x0007
+75278: addiu a1, a1, 20860  -> 0x0007517C          <-- also low, unrelocated
+75284: lui a2, 0x0001
+75294: lui v0, 0x0007
+75298: addiu v0, v0, 32224  -> 0x00077DE0          <-- also low, unrelocated
+```
+`find_boot_reloc.py` finds NO relocation entries for these addresses. These `lui` immediates are
+low-range addresses that a real PSP loader rebases by adding the segment base (`kLoadBase =
+0x08804000`). Our `load_and_relocate` only applies explicit relocation records, so these stay at
+`0x00010000`/`0x0007xxxx` and the first `sw` crashes. This is the SAME class of bug as the kjfs
+`jal@+0x444` fix — missing base relocation — but in BOOT.BIN and affecting several `lui`s.
+
+The runtime write-watch confirmed the sequence: `sw 0` to the table-index global at `0x089B7B80`
+(1 -> 0) immediately before the crash; no audio-module involvement. The `0x10000` register dump
+was stale (the runtime warns hot registers may be stale on unwind) — the real fault is the
+unrelocated `lui a1,0x0001` store target.
+
+Next fix to try: extending GuestMemory's `contains`/`resolve` to back the low `0x00010000`
+scratch region, OR patching the AOT-generated code (the `lui` is folded into AOT logic, so patching
+guest RAM for BOOT.BIN — which is AOT-compiled, not fetched from memory — has no effect; verified
+run162, no crash change). This is a runtime/runtime-memory change in gitignored Yakumo code, not a
+game-logic fix. The mount gate fix remains the durable, committed achievement.
+
+
 ## Session 2026-11-21 (forced-open attempt) — kjfs open synthesis, FALSIFIED
 
 Hypothesis: the engine issues `kjfs::mount("stage/title/data.cnf")` at frame 36 but never the

@@ -502,8 +502,9 @@ extern "C" void mgsa_be_hook(unsigned int addr, unsigned int pc) {
 extern "C" void mgsa_79400_hook(unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3) {
     if (std::getenv("MGSA_INIT_TRACE") == nullptr) return;
     static int shown = 0;
-    if (a1 == 0u && a0 == 0xFFFFFFFFu) return;  // skip normal frame-limiter calls
-    if (shown++ >= 30) return;
+    // Only print around the crash frame, all calls.
+    if (g_host.vblank_count < 106u || g_host.vblank_count > 112u) return;
+    if (shown++ >= 60) return;
     auto &memory = g_host.runtime->memory();
     std::cout << "[79400] frame=" << std::dec << g_host.vblank_count
               << " a0=" << std::hex << a0 << " a1=" << a1 << " a2=" << a2 << " a3=" << a3
